@@ -33,6 +33,8 @@ on:
   pull_request:       # Run on pull-request
     paths-ignore:     # File-patterns to ignore
     - '**.md'         # Ignore changes to *.md files
+    
+  workflow_dispatch:
 
 #-------------------------------------------------------------------------------
 # Define application name & version
@@ -40,12 +42,12 @@ on:
 
 env:
   VERSION: "3.2.3"
-  QT_VERSION_LINUX: 6.9.1
-  QT_VERSION_MACOS: 6.9.1
-  QT_VERSION_WINDOWS: 6.9.1
-  EXECUTABLE: "Serial-Studio-Pro"
-  APPLICATION: "Serial Studio Pro"
-  UNIXNAME: "serial-studio-pro"
+  QT_VERSION_LINUX: 6.9.3
+  QT_VERSION_MACOS: 6.9.3
+  QT_VERSION_WINDOWS: 6.9.3
+  EXECUTABLE: "Serial-Studio-v3.2.3"
+  APPLICATION: "Serial Studio v3.2.3"
+  UNIXNAME: "serial-studio-3.2.3"
   QML_DIR: "../../app/qml"
   PUBLISHER: "Alex Spataru"
   INSTALL_QT_MACOS: true
