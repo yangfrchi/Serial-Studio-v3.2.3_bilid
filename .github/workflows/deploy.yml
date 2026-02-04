@@ -145,8 +145,8 @@ jobs:
           -DPRODUCTION_OPTIMIZATION=ON `
           -DENABLE_HARDENING=ON `
           -DCMAKE_BUILD_TYPE=Release `
-          -DBUILD_COMMERCIAL=ON `
-          -DBUILD_GPL3=OFF
+          -DBUILD_COMMERCIAL=OFF `
+          -DBUILD_GPL3=ON
 
     - name: '🚧 Build application'
       run: |
