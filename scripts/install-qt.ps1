@@ -92,7 +92,6 @@ Start-Process -FilePath $INSTALLER_PATH `
         "--email", "`"$QT_USERNAME`"",
         "--pw", "`"$QT_PASSWORD`"",
         "--accept-licenses",
-        "--accept-messages",
         "--default-answer",
         "--confirm-command",
         "install", "$ALIAS_PACKAGE"
