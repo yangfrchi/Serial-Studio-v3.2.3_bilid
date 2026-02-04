@@ -1,0 +1,2186 @@
+/*
+ * Serial Studio
+ * https://serial-studio.com/
+ *
+ * Copyright (C) 2020–2025 Alex Spataru
+ *
+ * This file is dual-licensed:
+ *
+ * - Under the GNU GPLv3 (or later) for builds that exclude Pro modules.
+ * - Under the Serial Studio Commercial License for builds that include
+ *   any Pro functionality.
+ *
+ * You must comply with the terms of one of these licenses, depending
+ * on your use case.
+ *
+ * For GPL terms, see <https://www.gnu.org/licenses/gpl-3.0.html>
+ * For commercial terms, see LICENSE_COMMERCIAL.md in the project root.
+ *
+ * SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-SerialStudio-Commercial
+ */
+
+#include <QPainter>
+#include <QClipboard>
+#include <QFontMetrics>
+#include <QApplication>
+
+#include "Console/Handler.h"
+#include "IO/Manager.h"
+#include "Misc/Translator.h"
+#include "Misc/TimerEvents.h"
+#include "Misc/ThemeManager.h"
+#include "UI/Widgets/Terminal.h"
+
+#ifdef BUILD_COMMERCIAL
+#  include "Licensing/LemonSqueezy.h"
+#endif
+
+/**
+ * @brief Define the number of max lines supported
+ */
+constexpr int MAX_LINES = 1000;
+
+/**
+ * @brief Constructs a Terminal object with the given parent item.
+ *
+ * Initializes the terminal widget, setting up various configurations, including
+ * font, palette, and buffer. It also establishes multiple signal-slot
+ * connections to handle theme changes, data input, device connections, and
+ * cursor blinking.
+ *
+ * @param parent Pointer to the parent QQuickItem.
+ *
+ * The constructor performs the following key actions:
+ * - Initializes internal buffers using `initBuffer()`.
+ * - Configures item flags to allow the terminal to accept mouse input, have
+ *   content, and manage focus appropriately.
+ * - Sets a monospaced font for text rendering using
+ *   `Misc::CommonFonts::instance().monoFont()`.
+ * - Configures the initial color palette by calling `onThemeChanged()`.
+ * - Connects to the theme manager to update the palette whenever the theme
+ *   changes.
+ * - Connects to the IO Handler handler to receive and append new data for
+ *   display.
+ * - Clears the screen when a device connection status changes.
+ * - Sets up a cursor blink timer and connects it to toggle the cursor
+ *   visibility.
+ * - Establishes a connection to redraw the terminal at a rate of 24 Hz for
+ *   smooth updates.
+ *
+ * @note The cursor flash time is retrieved from
+ * `QGuiApplication::styleHints()`, and the blink interval is adjusted
+ * accordingly.
+ */
+Widgets::Terminal::Terminal(QQuickItem *parent)
+  : QQuickPaintedItem(parent)
+  , m_cWidth(0)
+  , m_cHeight(0)
+  , m_borderX(0)
+  , m_borderY(0)
+  , m_scrollOffsetY(0)
+  , m_state(Text)
+  , m_autoscroll(true)
+  , m_ansiColors(false)
+  , m_emulateVt100(false)
+  , m_cursorVisible(true)
+  , m_mouseTracking(false)
+  , m_currentFormatValue(0)
+  , m_stateChanged(false)
+{
+  // Initialize data buffer
+  initBuffer();
+
+  // Configure QML item flags to accept mouse input
+  setFlag(ItemHasContents, true);
+  setFlag(ItemIsFocusScope, true);
+  setFlag(ItemAcceptsInputMethod, true);
+  setAcceptedMouseButtons(Qt::AllButtons);
+
+  // Set rendering hints
+  setMipmap(true);
+  setOpaquePainting(true);
+
+  // Load the welcome guide
+  loadWelcomeGuide();
+
+  // Set font from console handler
+  setFont(Console::Handler::instance().font());
+
+  // Update font when settings change
+  connect(&Console::Handler::instance(), &Console::Handler::fontChanged, this,
+          [this] { setFont(Console::Handler::instance().font()); });
+
+  // Set palette
+  onThemeChanged();
+  connect(&Misc::ThemeManager::instance(), &Misc::ThemeManager::themeChanged,
+          this, &Widgets::Terminal::onThemeChanged);
+
+  // Receive data from the Console::Console handler
+  connect(&Console::Handler::instance(), &Console::Handler::displayString, this,
+          &Widgets::Terminal::append);
+  connect(&Console::Handler::instance(), &Console::Handler::cleared, this,
+          &Widgets::Terminal::clear);
+
+  // Clear the screen when device is connected/disconnected
+  connect(&IO::Manager::instance(), &IO::Manager::connectedChanged, this,
+          [=, this] {
+            if (IO::Manager::instance().isConnected())
+              clear();
+            else if (m_data.isEmpty())
+              loadWelcomeGuide();
+          });
+
+  // Redraw widget as soon as it is visible
+  connect(this, &Widgets::Terminal::visibleChanged, this, [=, this] {
+    if (isVisible())
+    {
+      if (autoscroll() && linesPerPage() > 0)
+      {
+        int cursorLine = m_cursorPosition.y();
+        int wrappedLines = 1;
+        if (cursorLine < m_data.size())
+        {
+          int lineLength = m_data[cursorLine].length();
+          wrappedLines
+              = (lineLength + maxCharsPerLine() - 1) / maxCharsPerLine();
+        }
+
+        int visualBottom = cursorLine + wrappedLines - 1;
+        setScrollOffsetY(qMax(0, visualBottom - linesPerPage() + 1));
+      }
+
+      update();
+    }
+  });
+
+  // Update welcome guide when Serial Studio changes its activation status
+#ifdef BUILD_COMMERCIAL
+  connect(&Licensing::LemonSqueezy::instance(),
+          &Licensing::LemonSqueezy::activatedChanged, this,
+          &Widgets::Terminal::loadWelcomeGuide);
+#endif
+
+  // Reload welcome guide when changing language
+  connect(&Misc::Translator::instance(), &Misc::Translator::languageChanged,
+          this, [this] { loadWelcomeGuide(); });
+
+  // Blink the cursor
+  m_cursorTimer.start(200);
+  m_cursorTimer.setTimerType(Qt::PreciseTimer);
+  connect(&m_cursorTimer, &QTimer::timeout, this,
+          &Widgets::Terminal::toggleCursor);
+
+  // Redraw the widget only when necessary
+  m_stateChanged = true;
+  connect(&Misc::TimerEvents::instance(), &Misc::TimerEvents::uiTimeout, this,
+          [=, this] {
+            if (isVisible() && m_stateChanged)
+            {
+              m_stateChanged = false;
+              update();
+            }
+          });
+}
+
+/**
+ * @brief Paints the terminal widget content.
+ *
+ * This method overrides the QQuickPaintedItem::paint() to render the terminal's
+ * content, including the text, cursor, and optional scrollbar.
+ *
+ * @param painter A QPainter object used to draw the terminal's content.
+ *
+ * The paint method performs the following key tasks:
+ * - Skips rendering if the terminal is not visible.
+ * - Prepares the painter by setting the current font and fills the terminal
+ *   background.
+ * - Draws each visible line of terminal data, using the current palette.
+ * - Draws the cursor if it is currently visible and within the visible range of
+ *   lines.
+ * - Draws a vertical scrollbar if autoscroll is disabled and not all lines are
+ *   visible.
+ *
+ * @note This function handles rendering for different terminal states,
+ * including cursor visibility and scrolling requirements.
+ */
+void Widgets::Terminal::paint(QPainter *painter)
+{
+  // Skip if item is not visible
+  if (!isVisible() || !painter)
+    return;
+
+  // Set font and prepare painter
+  painter->setFont(m_font);
+  int lineHeight = m_cHeight;
+
+  // Calculate the range of lines to be painted
+  const int firstLine = m_scrollOffsetY;
+  const int lastVLine = qMin(firstLine + linesPerPage(), lineCount() - 1);
+
+  // Draw selection rectangles
+  int y = m_borderY;
+  for (int i = firstLine; i <= lastVLine && y < height() - m_borderY; ++i)
+  {
+    // Obtain the line data
+    const QString &line = m_data[i];
+
+    // Check if this line is within the selection range
+    bool lineFullySelected = !m_selectionEnd.isNull()
+                             && i >= m_selectionStart.y()
+                             && i < m_selectionEnd.y();
+
+    // Handle empty lines
+    if (line.isEmpty())
+    {
+      // Draw selection rectangle if required for this line
+      if (lineFullySelected)
+      {
+        QRect selectionRect(m_borderX, y, width() - 2 * m_borderX, m_cHeight);
+        painter->fillRect(selectionRect, m_palette.color(QPalette::Highlight));
+      }
+
+      // Go to next line
+      y += lineHeight;
+      continue;
+    }
+
+    // If the line is fully selected, draw rectangles for each wrapped segment
+    if (lineFullySelected)
+    {
+      const int wrappedLines = qMax(1, (line.length() + maxCharsPerLine() - 1)
+                                           / maxCharsPerLine());
+      for (int wrapIndex = 0;
+           wrapIndex < wrappedLines && y < height() - m_borderY; ++wrapIndex)
+      {
+        QRect selectionRect(m_borderX, y, width() - 2 * m_borderX, m_cHeight);
+        painter->fillRect(selectionRect, m_palette.color(QPalette::Highlight));
+        y += lineHeight;
+      }
+
+      continue;
+    }
+
+    // Render selection for line with word-wrapping and variable-width chars
+    int start = 0;
+    while (start < line.length())
+    {
+      const int lineEnd = qMin<int>(start + maxCharsPerLine(), line.length());
+
+      if (!m_selectionEnd.isNull() && i >= m_selectionStart.y()
+          && i <= m_selectionEnd.y())
+      {
+        int selectionStartX, selectionEndX;
+
+        // Specific case for the first line of the selection
+        if (i == m_selectionStart.y())
+        {
+          selectionStartX = qMax(m_selectionStart.x(), start);
+          selectionEndX = (i == m_selectionEnd.y())
+                              ? qMin(m_selectionEnd.x(), lineEnd)
+                              : lineEnd;
+        }
+
+        // Specific case for the last line of the selection
+        else if (i == m_selectionEnd.y())
+        {
+          selectionStartX = start;
+          selectionEndX = qMin(m_selectionEnd.x(), lineEnd);
+        }
+
+        // Entire line selected within the bounds of start and end
+        else
+        {
+          selectionStartX = start;
+          selectionEndX = lineEnd;
+        }
+
+        if (selectionStartX < selectionEndX)
+        {
+          int startX = m_borderX;
+          int selectionWidth = 0;
+
+          // Cap for selection width
+          int maxSelectionWidth = width() - 2 * m_borderX;
+
+          for (int j = start; j < selectionEndX; ++j)
+          {
+            int charWidth = painter->fontMetrics().horizontalAdvance(line[j]);
+
+            if (j < selectionStartX)
+              startX += charWidth;
+            else
+              selectionWidth += charWidth;
+          }
+
+          // Cap the selection width to fit within the allowed area
+          selectionWidth
+              = qMin(selectionWidth, maxSelectionWidth - (startX - m_borderX));
+
+          // Draw the selection rectangle
+          QRect selectionRect(startX, y, selectionWidth, m_cHeight);
+          painter->fillRect(selectionRect,
+                            m_palette.color(QPalette::Highlight));
+        }
+      }
+
+      y += lineHeight;
+      start = lineEnd;
+    }
+  }
+
+  // Draw characters one by one with variable width handling
+  y = m_borderY;
+  const QColor defaultTextColor = m_palette.color(QPalette::Text);
+  for (int i = firstLine; i <= lastVLine && y < height() - m_borderY; ++i)
+  {
+    // Obtain line data
+    const QString &line = m_data[i];
+
+    // Skip empty lines, but draw line break
+    if (line.isEmpty())
+    {
+      y += lineHeight;
+      continue;
+    }
+
+    // Obtain color data for this line (only if ANSI colors enabled)
+    const QList<CharColor> *colorLine = nullptr;
+    if (ansiColors() && i < m_colorData.size())
+      colorLine = &m_colorData[i];
+
+    // Render line with word-wrapping
+    int start = 0;
+    while (start < line.length())
+    {
+      const int end = qMin<int>(start + maxCharsPerLine(), line.length());
+      const QString segment = line.mid(start, end - start);
+      int x = m_borderX;
+
+      // Fast path: no ANSI colors - use single pen color for all characters
+      if (!colorLine)
+      {
+        painter->setPen(defaultTextColor);
+        for (int j = 0; j < segment.length(); ++j)
+        {
+          const QString character = segment.mid(j, 1);
+          int charWidth = painter->fontMetrics().horizontalAdvance(character);
+          painter->drawText(x, y, charWidth, m_cHeight, Qt::AlignCenter,
+                            character);
+          x += charWidth;
+        }
+      }
+      // Slow path: ANSI colors - pre-calculate positions, draw backgrounds,
+      // then text
+      else
+      {
+        // Pre-calculate character info
+        struct CharInfo
+        {
+          QString text;
+          int x;
+          int width;
+          QColor fgColor;
+          QColor bgColor;
+        };
+
+        QVector<CharInfo> charInfos;
+        charInfos.reserve(segment.length());
+
+        int xPos = x;
+        for (int j = 0; j < segment.length(); ++j)
+        {
+          const QString character = segment.mid(j, 1);
+          const int charWidth
+              = painter->fontMetrics().horizontalAdvance(character);
+          const int charIndex = start + j;
+
+          CharInfo info;
+          info.text = character;
+          info.x = xPos;
+          info.width = charWidth;
+          info.fgColor = defaultTextColor;
+
+          if (charIndex < colorLine->size())
+          {
+            const CharColor &charColor = (*colorLine)[charIndex];
+            if (charColor.foreground.isValid())
+              info.fgColor = charColor.foreground;
+            info.bgColor = charColor.background;
+          }
+
+          charInfos.append(info);
+          xPos += charWidth;
+        }
+
+        // First pass: draw all backgrounds
+        // Use the same Y position as drawText since we're using Qt::AlignCenter
+        for (const CharInfo &info : charInfos)
+        {
+          if (info.bgColor.isValid())
+          {
+            painter->fillRect(info.x, y, info.width, m_cHeight, info.bgColor);
+          }
+        }
+
+        // Second pass: draw all text
+        for (const CharInfo &info : charInfos)
+        {
+          painter->setPen(info.fgColor);
+          painter->drawText(info.x, y, info.width, m_cHeight, Qt::AlignCenter,
+                            info.text);
+        }
+
+        x = xPos;
+      }
+
+      y += lineHeight;
+      start = end;
+    }
+  }
+
+  // Draw cursor if visible
+  if (m_cursorVisible)
+  {
+    const int cursorLine = m_cursorPosition.y();
+    const int cursorCol = m_cursorPosition.x();
+
+    int visualLineY = m_borderY;
+    bool cursorDrawn = false;
+
+    for (int i = firstLine; i <= lastVLine && i < m_data.size(); ++i)
+    {
+      const QString &line = m_data[i];
+
+      if (line.isEmpty())
+      {
+        if (i == cursorLine)
+        {
+          painter->setPen(m_palette.color(QPalette::Text));
+          painter->drawText(m_borderX, visualLineY + m_cHeight,
+                            QStringLiteral("█"));
+          cursorDrawn = true;
+          break;
+        }
+
+        visualLineY += lineHeight;
+        continue;
+      }
+
+      int start = 0;
+      while (start < line.length())
+      {
+        const int end = qMin<int>(start + maxCharsPerLine(), line.length());
+
+        if (i == cursorLine && cursorCol >= start && cursorCol <= end)
+        {
+          int cursorX = m_borderX;
+          for (int j = start; j < cursorCol && j < end; ++j)
+            cursorX += painter->fontMetrics().horizontalAdvance(line[j]);
+
+          painter->setPen(m_palette.color(QPalette::Text));
+          painter->drawText(cursorX, visualLineY + m_cHeight,
+                            QStringLiteral("█"));
+          cursorDrawn = true;
+          break;
+        }
+
+        visualLineY += lineHeight;
+        start = end;
+      }
+
+      if (cursorDrawn)
+        break;
+    }
+
+    if (!cursorDrawn && cursorLine >= m_data.size())
+    {
+      painter->setPen(m_palette.color(QPalette::Text));
+      painter->drawText(m_borderX, visualLineY + m_cHeight,
+                        QStringLiteral("█"));
+    }
+  }
+
+  // Draw scrollbar if required
+  if (!autoscroll() && lineCount() > linesPerPage())
+  {
+    // Get available height
+    const int availableHeight = height() - 2 * m_borderY;
+
+    // Set dimensions
+    const int scrollbarWidth = 6;
+    int scrollbarHeight = qMax(20.0, qPow(availableHeight, 2) / lineCount());
+    if (scrollbarHeight > availableHeight / 2)
+      scrollbarHeight = availableHeight / 2;
+
+    // Set scrollbar position
+    int x = width() - scrollbarWidth - m_borderX;
+    y = (m_scrollOffsetY / static_cast<float>(lineCount() - linesPerPage()))
+            * (availableHeight - scrollbarHeight)
+        - m_borderY;
+    y = qMax(m_borderY, y);
+
+    // Draw the scrollbar
+    QRect scrollbarRect(x, y, scrollbarWidth, scrollbarHeight);
+    QBrush scrollbarBrush(m_palette.color(QPalette::Window));
+    painter->setRenderHint(QPainter::Antialiasing);
+    painter->setBrush(scrollbarBrush);
+    painter->setPen(Qt::NoPen);
+    painter->drawRoundedRect(scrollbarRect, scrollbarWidth / 2,
+                             scrollbarWidth / 2);
+  }
+}
+
+/**
+ * @brief Returns the width of a single terminal character.
+ * @return
+ */
+int Widgets::Terminal::charWidth() const
+{
+  return m_cWidth;
+}
+
+/**
+ * @brief Returns the height of a single terminal character.
+ * @return
+ */
+int Widgets::Terminal::charHeight() const
+{
+  return m_cHeight;
+}
+
+/**
+ * @brief Gets the current font used by the terminal.
+ *
+ * @return The QFont object representing the terminal's current font.
+ */
+const QFont &Widgets::Terminal::font() const
+{
+  return m_font;
+}
+
+/**
+ * @brief Gets the current color palette used by the terminal.
+ *
+ * @return The QPalette object representing the terminal's color palette.
+ */
+const QPalette &Widgets::Terminal::palette() const
+{
+  return m_palette;
+}
+
+/**
+ * @brief Checks if autoscroll is enabled.
+ *
+ * @return True if autoscroll is enabled, false otherwise.
+ */
+bool Widgets::Terminal::autoscroll() const
+{
+  return m_autoscroll;
+}
+
+/**
+ * @brief Checks if there is a valid text selection available for copying.
+ *
+ * This function determines whether a selection is available in the terminal
+ * for copying. A selection is considered invalid if:
+ *
+ * - The selection start or selection end is null.
+ * - The terminal's data buffer is empty.
+ *
+ * @return True if no valid selection is available, otherwise false.
+ *
+ * @note This function effectively checks if it is possible to perform a copy
+ * operation.
+ */
+bool Widgets::Terminal::copyAvailable() const
+{
+  return (!m_selectionEnd.isNull() || !m_selectionStart.isNull())
+         && !m_data.isEmpty();
+}
+
+/**
+ * @brief Checks if VT-100 emulation mode is enabled.
+ *
+ * @return True if VT-100 emulation is enabled, false otherwise.
+ */
+bool Widgets::Terminal::vt100emulation() const
+{
+  return m_emulateVt100;
+}
+
+/**
+ * @brief Checks if ANSI color support is enabled.
+ *
+ * @return True if ANSI colors are enabled, false otherwise.
+ */
+bool Widgets::Terminal::ansiColors() const
+{
+  return m_ansiColors && m_emulateVt100;
+}
+
+/**
+ * @brief Gets the total number of lines in the terminal's data buffer.
+ *
+ * @return The number of lines currently stored in the terminal's data buffer.
+ */
+int Widgets::Terminal::lineCount() const
+{
+  return m_data.size();
+}
+
+/**
+ * @brief Gets the number of lines that can be displayed per page.
+ *
+ * @return The number of lines that fit within the current terminal height.
+ */
+int Widgets::Terminal::linesPerPage() const
+{
+  if (m_cHeight <= 0)
+    return 0;
+
+  return static_cast<int>(qFloor((height() - 2 * m_borderY) / m_cHeight));
+}
+
+/**
+ * @brief Gets the current vertical scroll offset.
+ *
+ * @return The vertical scroll offset in lines.
+ */
+int Widgets::Terminal::scrollOffsetY() const
+{
+  return m_scrollOffsetY;
+}
+
+/**
+ * @brief Calculates the maximum number of characters that can fit on a single
+ *        line of the terminal.
+ *
+ * This function determines the maximum number of characters that can be
+ * displayed on a single line of the terminal, based on the current width of the
+ * widget and the width of individual characters. It ensures a minimum value to
+ * maintain consistency, especially during UI loading or resizing.
+ *
+ * The calculation takes into account:
+ * - The current width of the terminal widget
+ * - The border width on both sides
+ * - The width of individual characters
+ *
+ * To prevent inconsistencies during UI initialization or extreme resizing,
+ * the function enforces a minimum return value of 84 characters per line.
+ *
+ * @return The maximum number of characters that can fit on a single line,
+ *         with a minimum value of 84.
+ */
+int Widgets::Terminal::maxCharsPerLine() const
+{
+  if (m_cWidth <= 0)
+    return 84;
+
+  const auto realValue = (width() - 2 * m_borderX) / m_cWidth;
+  return qMax<int>(84, realValue);
+}
+
+/**
+ * @brief Gets the current cursor position within the terminal.
+ *
+ * @return A QPoint representing the current cursor position, in character
+ *         coordinates.
+ */
+const QPoint &Widgets::Terminal::cursorPosition() const
+{
+  return m_cursorPosition;
+}
+
+/**
+ * @brief Converts a pixel position to a cursor position.
+ *
+ * @param pos The pixel position within the terminal.
+ * @return A QPoint representing the cursor position corresponding to the given
+ *         pixel position.
+ */
+QPoint Widgets::Terminal::positionToCursor(const QPoint &pos) const
+{
+  int localY = (pos.y() - m_borderY) / m_cHeight;
+  int remainingY = localY;
+
+  // If mouse is above the terminal content area, return first valid position
+  if (localY < 0)
+  {
+    if (m_scrollOffsetY < m_data.size())
+      return QPoint(0, m_scrollOffsetY);
+    return QPoint(0, 0);
+  }
+
+  for (int i = m_scrollOffsetY; i < m_data.size(); ++i)
+  {
+    const QString &line = m_data[i];
+
+    if (line.isEmpty())
+    {
+      if (remainingY == 0)
+        return QPoint(0, i);
+
+      remainingY--;
+    }
+
+    else
+    {
+      int lines = (line.length() + maxCharsPerLine() - 1) / maxCharsPerLine();
+      if (remainingY < lines)
+      {
+        int segmentIndex = qMax(0, remainingY);
+        int segmentStart = segmentIndex * maxCharsPerLine();
+        int segmentEnd = qMin(segmentStart + maxCharsPerLine(), line.length());
+
+        int x = pos.x() - m_borderX;
+        int widthSum = 0;
+
+        for (int j = segmentStart; j < segmentEnd; ++j)
+        {
+          int charWidth = QFontMetrics(m_font).horizontalAdvance(line[j]);
+          if (widthSum + charWidth > x)
+            return QPoint(j, i);
+          widthSum += charWidth;
+        }
+
+        return QPoint(segmentEnd, i);
+      }
+
+      remainingY -= lines;
+    }
+  }
+
+  if (!m_data.isEmpty())
+  {
+    int lastLine = m_data.size() - 1;
+    int lastChar = m_data.last().length();
+    return QPoint(lastChar, lastLine);
+  }
+
+  return QPoint(0, 0);
+}
+
+/**
+ * @brief Copies the currently selected text to the system clipboard.
+ *
+ * This function copies the currently selected text from the terminal buffer
+ * to the system clipboard, ensuring the correct order of the start and end
+ * points of the selection:
+ * - If no valid selection is available (`copyAvailable()` returns true), the
+ *   function returns without action.
+ * - The correct selection boundaries are determined and adjusted if needed.
+ * - Iterates over the selected lines and extracts the corresponding text,
+ *   preserving line breaks.
+ * - Copies the extracted text to the system clipboard for use in other
+ *   applications.
+ *
+ * @note The copied text includes line breaks between lines to preserve
+ * formatting.
+ *
+ * @see copyAvailable(), QClipboard, QGuiApplication::clipboard()
+ */
+void Widgets::Terminal::copy()
+{
+  // Ensure that there is a valid selection
+  if (!copyAvailable())
+    return;
+
+  // Determine the correct order of start and end for selection
+  QString copiedText;
+  QPoint start = m_selectionStart;
+  QPoint end = m_selectionEnd;
+
+  if (start.y() > end.y() || (start.y() == end.y() && start.x() > end.x()))
+    std::swap(start, end);
+
+  // Iterate over the lines within the selection range
+  for (int lineIndex = start.y(); lineIndex <= end.y(); ++lineIndex)
+  {
+    const QString &line = m_data[lineIndex];
+
+    int startX = (lineIndex == start.y()) ? start.x() : 0;
+    int endX = (lineIndex == end.y()) ? end.x() : line.size();
+
+    // Adjust if the selection is inverted
+    if (start.y() == end.y() && start.x() > end.x())
+      std::swap(startX, endX);
+
+    // Check if the selection spans the entire line
+    if (lineIndex != start.y() && lineIndex != end.y())
+    {
+      startX = 0;
+      endX = line.size();
+    }
+
+    // Extract the selected portion of the line
+    if (startX < endX)
+      copiedText.append(line.mid(startX, endX - startX));
+
+    // If the selection spans the entire line, add a newline character
+    if (lineIndex != end.y() || (startX == 0 && endX == line.size()))
+      copiedText.append('\n');
+  }
+
+  // Copy the selected text to the clipboard
+  QClipboard *clipboard = QGuiApplication::clipboard();
+  clipboard->setText(copiedText);
+}
+
+/**
+ * @brief Clears the terminal's content.
+ *
+ * Resets the data buffer, moves the cursor to the top-left position,
+ * and enables autoscroll. This effectively clears the terminal's display.
+ */
+void Widgets::Terminal::clear()
+{
+  initBuffer();
+  setCursorPosition(0, 0);
+  setAutoscroll(true);
+  m_stateChanged = true;
+}
+
+/**
+ * @brief Selects all the text currently present in the terminal.
+ *
+ * Updates the selection state to encompass all text in the terminal, if
+ * available. Emits the selectionChanged() signal to notify that the selection
+ * has been updated.
+ */
+void Widgets::Terminal::selectAll()
+{
+  // Skip if there is no data to select
+  if (m_data.isEmpty())
+    return;
+
+  // Set selection start at the beginning (top-left corner)
+  m_selectionStart = QPoint(0, 0);
+
+  // Set selection end at the last character of the last line
+  int lastLineIndex = m_data.size() - 1;
+  int lastCharIndex = m_data[lastLineIndex].size();
+  m_selectionEnd = QPoint(lastCharIndex, lastLineIndex);
+
+  // Since we're selecting everything, we do not need a "start cursor"
+  m_selectionStartCursor = m_selectionStart;
+
+  // Emit signal to indicate that the selection has changed
+  m_stateChanged = true;
+  Q_EMIT selectionChanged();
+}
+
+/**
+ * @brief Sets the font used for rendering the terminal text.
+ *
+ * @param font The QFont object to be used for terminal text.
+ *
+ * Updates the internal font, recalculates character dimensions, and adjusts the
+ * terminal border accordingly. Emits the fontChanged() signal to notify about
+ * the change.
+ */
+void Widgets::Terminal::setFont(const QFont &font)
+{
+  // Update font
+  m_font = font;
+
+  // Ensure that antialiasing is enabled
+  m_font.setStyleStrategy(QFont::PreferAntialias);
+
+  // Get size of font (in pixels)
+  auto metrics = QFontMetrics(m_font);
+
+  // Update character sizes
+  m_cHeight = metrics.height();
+  m_cWidth = metrics.horizontalAdvance("M");
+
+  // Update terminal border
+  m_borderX = qMax(m_cWidth, m_cHeight) / 2;
+  m_borderY = qMax(m_cWidth, m_cHeight) / 2;
+
+  // Notify QML
+  Q_EMIT fontChanged();
+}
+
+/**
+ * @brief Enables or disables autoscroll.
+ *
+ * @param enabled If true, autoscroll is enabled; otherwise, it is disabled.
+ *
+ * Changes the autoscroll behavior of the terminal and emits the
+ * autoscrollChanged() signal.
+ */
+void Widgets::Terminal::setAutoscroll(const bool enabled)
+{
+  m_autoscroll = enabled;
+  Q_EMIT autoscrollChanged();
+}
+
+/**
+ * @brief Sets the vertical scroll offset for the terminal.
+ *
+ * @param offset The new vertical scroll offset value.
+ *
+ * If the scroll offset is changed, it updates the internal offset, emits the
+ * scrollOffsetYChanged() signal, and triggers a redraw of the terminal.
+ */
+void Widgets::Terminal::setScrollOffsetY(const int offset)
+{
+  if (m_scrollOffsetY != offset)
+  {
+    m_scrollOffsetY = offset;
+    Q_EMIT scrollOffsetYChanged();
+
+    update();
+  }
+}
+
+/**
+ * @brief Sets the color palette used by the terminal.
+ *
+ * @param palette The QPalette object representing the new color palette.
+ *
+ * Updates the terminal's color palette and emits the colorPaletteChanged()
+ * signal to indicate that the palette has been updated.
+ */
+void Widgets::Terminal::setPalette(const QPalette &palette)
+{
+  m_palette = palette;
+  Q_EMIT colorPaletteChanged();
+}
+
+/**
+ * @brief Enables or disables VT-100 emulation.
+ *
+ * @param enabled If true, VT-100 emulation is enabled; otherwise, it is
+ * disabled.
+ *
+ * Controls whether the terminal interprets VT-100 escape sequences for
+ * additional terminal functionality. Emits the vt100EmulationChanged() signal
+ * on change.
+ */
+void Widgets::Terminal::setVt100Emulation(const bool enabled)
+{
+  m_emulateVt100 = enabled;
+  Q_EMIT vt100EmulationChanged();
+}
+
+/**
+ * @brief Enables or disables ANSI color support.
+ *
+ * @param enabled If true, ANSI colors are enabled; otherwise, text uses the
+ * default palette color.
+ *
+ * When enabled, the terminal interprets ANSI SGR escape sequences for text
+ * coloring (codes 30-37 for foreground colors, 0 for reset, 1 for bold).
+ * Emits the ansiColorsChanged() signal on change.
+ */
+void Widgets::Terminal::setAnsiColors(const bool enabled)
+{
+  m_ansiColors = enabled;
+
+  if (enabled)
+  {
+    m_currentColor = m_palette.color(QPalette::Text);
+    m_colorData.reserve(MAX_LINES);
+  }
+
+  Q_EMIT ansiColorsChanged();
+}
+
+/**
+ * @brief Toggles the visibility of the cursor.
+ *
+ * Flips the visibility state of the cursor, which is typically used to create
+ * a blinking cursor effect.
+ */
+void Widgets::Terminal::toggleCursor()
+{
+  m_stateChanged = true;
+  m_cursorVisible = !m_cursorVisible;
+}
+
+/**
+ * @brief Updates the terminal's color palette when the theme changes.
+ *
+ * Retrieves the current theme colors from the ThemeManager and updates the
+ * terminal's color palette accordingly. The new palette is used for rendering
+ * various elements, such as text, background, buttons, and highlights.
+ *
+ * @note After updating the palette, the terminal is redrawn to reflect the
+ *       changes.
+ */
+void Widgets::Terminal::onThemeChanged()
+{
+  // clang-format off
+  m_stateChanged = true;
+  const auto theme = &Misc::ThemeManager::instance();
+  m_palette.setColor(QPalette::Text, theme->getColor("console_text"));
+  m_palette.setColor(QPalette::Base, theme->getColor("console_base"));
+  m_palette.setColor(QPalette::Window, theme->getColor("console_border"));
+  m_palette.setColor(QPalette::Highlight, theme->getColor("console_highlight"));
+  setFillColor(m_palette.color(QPalette::Base));
+  updateAnsiColorPalette();
+  update();
+  // clang-format on
+}
+
+/**
+ * @brief Displays the localized welcome guide in the terminal widget, without
+ *        modifying the terminal output.
+ */
+void Widgets::Terminal::loadWelcomeGuide()
+{
+  // Define logo
+  // clang-format off
+  static const QString logo = \
+    "▒█▀▀▀█ ▒█▀▀▀ ▒█▀▀█ ▀█▀ ░█▀▀█ ▒█░░░ 　 ▒█▀▀▀█ ▀▀█▀▀ ▒█░▒█ ▒█▀▀▄ ▀█▀ ▒█▀▀▀█\n" \
+    "░▀▀▀▄▄ ▒█▀▀▀ ▒█▄▄▀ ▒█░ ▒█▄▄█ ▒█░░░ 　 ░▀▀▀▄▄ ░▒█░░ ▒█░▒█ ▒█░▒█ ▒█░ ▒█░░▒█\n" \
+    "▒█▄▄▄█ ▒█▄▄▄ ▒█░▒█ ▄█▄ ▒█░▒█ ▒█▄▄█ 　 ▒█▄▄▄█ ░▒█░░ ░▀▄▄▀ ▒█▄▄▀ ▄█▄ ▒█▄▄▄█\n\n";
+  // clang-format on
+
+  // Clear screen & disable autoscrolling while writing welcome text
+  clear();
+  setAutoscroll(false);
+
+  // Append translated welcome message
+  append(logo);
+  append(Misc::Translator::instance().welcomeConsoleText());
+
+  // Re-enable autoscroll
+  setAutoscroll(true);
+
+  // Set scroll offset
+  const int lines = linesPerPage();
+  if (lines > 0 && height() > 0)
+  {
+    int cursorLine = m_cursorPosition.y();
+    int wrappedLines = 1;
+    if (cursorLine < m_data.size())
+    {
+      int lineLength = m_data[cursorLine].length();
+      wrappedLines = (lineLength + maxCharsPerLine() - 1) / maxCharsPerLine();
+    }
+
+    int visualBottom = cursorLine + wrappedLines - 1;
+    setScrollOffsetY(qMax(0, visualBottom - lines + 1));
+  }
+
+  // Schedule redraw
+  m_stateChanged = true;
+}
+
+/**
+ * @brief Appends a string of data to the terminal, processing each character
+ *        accordingly.
+ *
+ * @param data The string of data to be appended to the terminal.
+ *
+ * This method processes each character in the provided data string,
+ * interpreting escape sequences, formatting commands, and resetting font styles
+ * based on the terminal's current state (Text, Escape, Format, ResetFont).
+ *
+ * The processed text is accumulated and then appended to the terminal's buffer.
+ *
+ * @see processText(), processEscape(), processFormat(), processResetFont(),
+ * appendString()
+ */
+void Widgets::Terminal::append(const QString &data)
+{
+  QString text;
+  auto it = data.constBegin();
+
+  while (it != data.constEnd())
+  {
+    auto byte = *it;
+    switch (m_state)
+    {
+      case Text:
+        processText(byte, text);
+        break;
+      case Escape:
+        processEscape(byte, text);
+        break;
+      case Format:
+        processFormat(byte, text);
+        break;
+      case ResetFont:
+        processResetFont(byte, text);
+        break;
+    }
+
+    ++it;
+  }
+
+  appendString(text);
+  m_stateChanged = true;
+}
+
+/**
+ * @brief Appends a string to the terminal's data buffer, updating the cursor
+ *        position.
+ *
+ * @param string The QString to be appended to the terminal.
+ *
+ * This method processes each character in the given string by:
+ * - Registering it in the terminal's internal buffer at the current cursor
+ *   position.
+ * - Moving the cursor to the right after each character is placed.
+ *
+ * If autoscroll is enabled, the vertical scroll offset (`scrollOffsetY`) is
+ * adjusted to ensure that the cursor remains visible, and
+ * `scrollOffsetYChanged()` is emitted to notify of any changes.
+ *
+ * @see replaceData(), setCursorPosition(), autoscroll()
+ */
+void Widgets::Terminal::appendString(QStringView string)
+{
+  // Ensure buffer memory does not exceed MAX_LINES
+  const int linesToDrop = m_data.size() - MAX_LINES + 1;
+  if (m_data.size() >= MAX_LINES && linesToDrop > 0)
+  {
+    m_data.erase(m_data.begin(), m_data.begin() + linesToDrop);
+    if (ansiColors() && m_colorData.size() >= linesToDrop)
+      m_colorData.erase(m_colorData.begin(), m_colorData.begin() + linesToDrop);
+
+    if (m_cursorPosition.y() >= linesToDrop)
+      m_cursorPosition.setY(m_cursorPosition.y() - linesToDrop);
+    else
+      m_cursorPosition.setY(0);
+
+    if (m_scrollOffsetY >= linesToDrop)
+      m_scrollOffsetY -= linesToDrop;
+    else
+      m_scrollOffsetY = 0;
+  }
+
+  // Register each character in the provided string
+  for (const auto &character : string)
+  {
+    // Obtain the current (x, y) cursor position
+    int cursorX = m_cursorPosition.x();
+    int cursorY = m_cursorPosition.y();
+
+    // Replace data in the console buffer at the current cursor position
+    replaceData(cursorX, cursorY, character);
+
+    // Increment the cursor position to the right after placing the character
+    setCursorPosition(cursorX + 1, cursorY);
+
+    // If we've reached the end of a wrapped line, move to the next line
+    if (m_cursorPosition.x() >= maxCharsPerLine())
+      setCursorPosition(0, m_cursorPosition.y() + 1);
+  }
+
+  // Adjust the scroll offset if autoscroll is enabled
+  if (autoscroll())
+  {
+    // Calculate the total number of wrapped lines for the current line
+    int cursorLine = m_cursorPosition.y();
+    int wrappedLines = 1;
+    if (cursorLine < m_data.size())
+    {
+      int lineLength = m_data[cursorLine].length();
+      wrappedLines = (lineLength + maxCharsPerLine() - 1) / maxCharsPerLine();
+    }
+
+    // Calculate the visual bottom of the wrapped line
+    int visualBottom = cursorLine + wrappedLines - 1;
+
+    // Set the scroll offset to ensure the bottom of the wrapped line is visible
+    m_scrollOffsetY = qMax(0, visualBottom - linesPerPage() + 1);
+    if (isVisible())
+      Q_EMIT scrollOffsetYChanged();
+  }
+}
+
+/**
+ * @brief Removes characters from the terminal buffer starting from the cursor
+ *        position.
+ *
+ * @param direction The direction to remove characters: either LeftDirection or
+ *                  RightDirection.
+ *
+ * @param len The number of characters to remove. Defaults to INT_MAX if a
+ *            negative value is provided.
+ *
+ * This method removes characters from the terminal buffer either to the left or
+ * right of the current cursor position:
+ *
+ * - If `direction` is `RightDirection`, it removes characters starting from the
+ *   cursor and moving to the right, up to the specified length or the end of
+ *   theline.
+ * - If `direction` is `LeftDirection`, it removes characters to the left of the
+ *   cursor, up to the specified length.
+ *
+ * Characters removed are replaced with a clear character (`'\x7F'`).
+ *
+ * @see replaceData(), setCursorPosition()
+ */
+void Widgets::Terminal::removeStringFromCursor(const Direction direction,
+                                               int len)
+{
+  // Obtain (x, y) position
+  const auto positionX = m_cursorPosition.x();
+  const auto positionY = m_cursorPosition.y();
+
+  // Ensure valid length
+  if (len < 0)
+    len = INT_MAX;
+
+  // Cap bytes to remove (right)
+  int removeSize = 0;
+  if (direction == RightDirection)
+  {
+    qsizetype l1 = m_data[positionY].size() - positionX;
+    qsizetype l2 = static_cast<qsizetype>(len);
+    removeSize = qMin(l1, l2);
+  }
+
+  // Cap bytes to remove (left)
+  else
+    removeSize = qMin(len, m_cursorPosition.x());
+
+  // Removal operation
+  int offset = 0;
+  const QChar clearChar('\x7F');
+  for (int i = 0; i < removeSize; ++i)
+  {
+    // Get offset depending on removal direction
+    if (direction == LeftDirection)
+      offset = -1;
+    else if (direction == RightDirection)
+      offset = i;
+
+    // Replace data in console screen
+    replaceData(m_cursorPosition.x() + offset, positionY, clearChar);
+  }
+}
+
+/**
+ * @brief Initializes the terminal's data buffer.
+ *
+ * Clears the existing data buffer and reservers memory for the scrollback.
+ *
+ * This function is typically used to reset the terminal state, ensuring
+ * efficient memory management for upcoming operations.
+ */
+void Widgets::Terminal::initBuffer()
+{
+  m_data.clear();
+  m_data.squeeze();
+  m_scrollOffsetY = 0;
+  m_data.reserve(MAX_LINES);
+
+  // Always clear color data on terminal reset
+  m_colorData.clear();
+  m_colorData.squeeze();
+
+  // Only pre-allocate color memory if ANSI colors is currently enabled
+  if (ansiColors())
+  {
+    m_colorData.reserve(MAX_LINES);
+    m_currentColor = m_palette.color(QPalette::Text);
+  }
+}
+
+/**
+ * @brief Processes a single character in the context of normal text input.
+ *
+ * @param byte The character to be processed.
+ * @param text A reference to a QString that accumulates printable characters.
+ *
+ * This method handles normal text input processing, managing different
+ * character cases:
+ * - If the character is an escape character (`0x1b`) and VT-100 emulation is
+ *   enabled, it switches the state to `Escape` after appending the current
+ *   accumulated text.
+ * - If the character is a newline (`'\n'`), the accumulated text is appended,
+ *   and a new line is created in the buffer.
+ * - If the character is a backspace (`'\b'`) and VT-100 emulation is enabled,
+ *   the cursor is moved one position to the left.
+ * - If the character is printable, it is appended to the accumulated `text`.
+ *
+ * This function helps manage cursor positioning and character input depending
+ * on the current state.
+ *
+ * @see appendString(), setCursorPosition(), vt100emulation()
+ */
+void Widgets::Terminal::processText(const QChar &byte, QString &text)
+{
+  if (byte.toLatin1() == 0x1b && vt100emulation())
+  {
+    appendString(text);
+    text.clear();
+    m_state = Escape;
+  }
+
+  else if (byte == '\n')
+  {
+    appendString(text);
+    text.clear();
+    setCursorPosition(0, m_cursorPosition.y() + 1);
+  }
+
+  else if (byte == '\b' && vt100emulation())
+  {
+    if (m_cursorPosition.x())
+    {
+      appendString(text);
+      text.clear();
+      setCursorPosition(m_cursorPosition.x() - 1, m_cursorPosition.y());
+    }
+  }
+
+  else if (byte.isPrint())
+    text.append(byte);
+}
+
+/**
+ * @brief Processes an escape sequence character.
+ *
+ * @param byte The character to be processed as part of the escape sequence.
+ * @param text A reference to a QString (currently unused in this method).
+ *
+ * This method handles the initial part of an escape sequence:
+ * - Resets the format values (`m_formatValue`, `m_formatValueY`) and related
+ *   state.
+ * - If the character is `'['`, it switches to `Format` state to process
+ *   additional formatting characters.
+ * - If the character is `'('`, it switches to `ResetFont` state for further
+ *   processing.
+ *
+ * @see processFormat(), m_state, m_formatValue, m_formatValueY
+ */
+void Widgets::Terminal::processEscape(const QChar &byte, QString &text)
+{
+  (void)text;
+
+  m_formatValues.clear();
+  m_currentFormatValue = 0;
+
+  if (byte == '[')
+    m_state = Format;
+
+  else if (byte == '(')
+    m_state = ResetFont;
+}
+
+/**
+ * @brief Processes characters in the context of a terminal format command.
+ *
+ * @param byte The character to be processed as part of a format command.
+ * @param text A reference to a QString (currently unused in this method).
+ *
+ * This method handles terminal formatting commands, including text formatting,
+ * cursor movement, and screen clearing:
+ * - Numeric characters are accumulated as format values (`m_formatValue`,
+ *   `m_formatValueY`).
+ * - The `';'` character indicates multiple format values, and subsequent values
+ *   are processed.
+ * - The `'m'` character exits the formatting state and returns to normal text.
+ * - Cursor movement commands (`'A'`, `'B'`, `'C'`, `'D'`) adjust the cursor
+ *   position.
+ * - The `'H'` character moves the cursor to the specified position
+ *   (`m_formatValue`, `m_formatValueY`).
+ * - The `'J'` character clears the screen based on `m_formatValue`.
+ * - The `'K'` character clears part of the current line, depending on
+ *   `m_formatValue`.
+ * - The `'P'` character removes characters from the cursor position.
+ * - If an unrecognized character is received, the state is reset to `Text`.
+ *
+ * @note Some functions (`J` and `K` with certain values) are not implemented
+ *       and will produce warnings.
+ *
+ * @see setCursorPosition(), removeStringFromCursor(), m_state, m_formatValue
+ */
+void Widgets::Terminal::processFormat(const QChar &byte, QString &text)
+{
+  (void)text;
+
+  // Obtain format value
+  if (byte >= '0' && byte <= '9')
+  {
+    m_currentFormatValue = m_currentFormatValue * 10 + (byte.cell() - '0');
+  }
+
+  // Control sequences
+  else
+  {
+    // Semicolon: store current value and prepare for next
+    if (byte == ';')
+    {
+      m_formatValues.append(m_currentFormatValue);
+      m_currentFormatValue = 0;
+      m_state = Format;
+    }
+
+    // Exit text formatting and apply ANSI color if enabled
+    else if (byte == 'm')
+    {
+      m_formatValues.append(m_currentFormatValue);
+      if (ansiColors())
+        applyAnsiColor(m_formatValues);
+
+      m_state = Text;
+    }
+
+    // Cursor movement
+    else if (byte >= 'A' && byte <= 'D')
+    {
+      const int value = m_currentFormatValue ? m_currentFormatValue : 1;
+      int x = 0;
+      int y = 0;
+      switch (byte.toLatin1())
+      {
+        case 'A':
+          x = m_cursorPosition.x();
+          y = qMax(0, m_cursorPosition.y() - value);
+          setCursorPosition(x, y);
+          break;
+        case 'B':
+          x = m_cursorPosition.x();
+          y = m_cursorPosition.y() + value;
+          setCursorPosition(x, y);
+          break;
+        case 'C':
+          x = m_cursorPosition.x() + value;
+          y = m_cursorPosition.y();
+          setCursorPosition(x, y);
+          break;
+        case 'D':
+          x = qMax(0, m_cursorPosition.x() - value);
+          y = m_cursorPosition.y();
+          setCursorPosition(x, y);
+          break;
+        default:
+          break;
+      }
+
+      m_state = Text;
+    }
+
+    // Move cursor to current format value?
+    else if (byte == 'H')
+    {
+      const int x = m_formatValues.value(0, 0);
+      const int y = m_formatValues.value(1, 0);
+      setCursorPosition(x, y);
+      m_state = Text;
+    }
+
+    // J function
+    else if (byte == 'J')
+    {
+      switch (m_currentFormatValue)
+      {
+        case 0:
+        case 1:
+        case 2:
+          clear();
+          break;
+        default:
+          qWarning() << "J" << m_currentFormatValue
+                     << "function not implemented!";
+          break;
+      }
+
+      m_state = Text;
+    }
+
+    // K function
+    else if (byte == 'K')
+    {
+      switch (m_currentFormatValue)
+      {
+        case 0:
+          removeStringFromCursor(RightDirection);
+          break;
+        case 1:
+        case 2:
+          qWarning() << "K" << m_currentFormatValue
+                     << "function not implemented!";
+          break;
+      }
+
+      m_state = Text;
+    }
+
+    // P function
+    else if (byte == 'P')
+    {
+      removeStringFromCursor(LeftDirection, m_currentFormatValue);
+      removeStringFromCursor(RightDirection);
+      m_state = Text;
+    }
+
+    // Reset state
+    else
+      m_state = Text;
+  }
+}
+
+/**
+ * @brief Processes a reset font command in the terminal's state machine.
+ *
+ * @param byte The character to be processed (unused in this method).
+ * @param text A reference to a QString (unused in this method).
+ *
+ * This method simply resets the terminal's state back to `Text`, ending any
+ * font reset operations. This is typically used to handle the completion of
+ * a font reset escape sequence.
+ *
+ * @see m_state
+ */
+void Widgets::Terminal::processResetFont(const QChar &byte, QString &text)
+{
+  (void)byte;
+  (void)text;
+  m_state = Text;
+}
+
+/**
+ * @brief Updates the ANSI color palette based on the current theme.
+ *
+ * Determines whether to use light or dark ANSI colors based on the background
+ * color luminance. Uses standard UNIX/Linux terminal color palette.
+ *
+ * Light themes (dark background) use bright colors, dark themes (light
+ * background) use darker colors for better contrast.
+ */
+void Widgets::Terminal::updateAnsiColorPalette()
+{
+  const auto theme = &Misc::ThemeManager::instance();
+  const QColor consoleBase = theme->getColor("console_base");
+  const QColor consoleText = theme->getColor("console_text");
+  const bool isDarkTheme = consoleText.lightness() > consoleBase.lightness();
+
+  // Colors for dark backgrounds
+  if (isDarkTheme)
+  {
+    // Standard colors
+    m_ansiStandardColors[0] = QColor(0, 0, 0);       // Black
+    m_ansiStandardColors[1] = QColor(205, 49, 49);   // Red
+    m_ansiStandardColors[2] = QColor(13, 188, 121);  // Green
+    m_ansiStandardColors[3] = QColor(229, 229, 16);  // Yellow
+    m_ansiStandardColors[4] = QColor(36, 114, 200);  // Blue
+    m_ansiStandardColors[5] = QColor(188, 63, 188);  // Magenta
+    m_ansiStandardColors[6] = QColor(17, 168, 205);  // Cyan
+    m_ansiStandardColors[7] = QColor(229, 229, 229); // White
+
+    // Bright colors
+    m_ansiBrightColors[0] = QColor(102, 102, 102); // Bright Black (Gray)
+    m_ansiBrightColors[1] = QColor(241, 76, 76);   // Bright Red
+    m_ansiBrightColors[2] = QColor(35, 209, 139);  // Bright Green
+    m_ansiBrightColors[3] = QColor(245, 245, 67);  // Bright Yellow
+    m_ansiBrightColors[4] = QColor(59, 142, 234);  // Bright Blue
+    m_ansiBrightColors[5] = QColor(214, 112, 214); // Bright Magenta
+    m_ansiBrightColors[6] = QColor(41, 184, 219);  // Bright Cyan
+    m_ansiBrightColors[7] = QColor(255, 255, 255); // Bright White
+  }
+
+  // Colors for light backgrounds
+  else
+  {
+    // Standard colors
+    m_ansiStandardColors[0] = QColor(0, 0, 0);       // Black
+    m_ansiStandardColors[1] = QColor(170, 0, 0);     // Red
+    m_ansiStandardColors[2] = QColor(0, 140, 0);     // Green
+    m_ansiStandardColors[3] = QColor(170, 140, 0);   // Yellow
+    m_ansiStandardColors[4] = QColor(0, 0, 170);     // Blue
+    m_ansiStandardColors[5] = QColor(170, 0, 170);   // Magenta
+    m_ansiStandardColors[6] = QColor(0, 140, 170);   // Cyan
+    m_ansiStandardColors[7] = QColor(170, 170, 170); // White
+
+    // Bright colors
+    m_ansiBrightColors[0] = QColor(85, 85, 85);  // Bright Black (Gray)
+    m_ansiBrightColors[1] = QColor(210, 0, 0);   // Bright Red
+    m_ansiBrightColors[2] = QColor(0, 170, 0);   // Bright Green
+    m_ansiBrightColors[3] = QColor(210, 170, 0); // Bright Yellow
+    m_ansiBrightColors[4] = QColor(0, 0, 210);   // Bright Blue
+    m_ansiBrightColors[5] = QColor(210, 0, 210); // Bright Magenta
+    m_ansiBrightColors[6] = QColor(0, 170, 210); // Bright Cyan
+    m_ansiBrightColors[7] = QColor(85, 85, 85);  // Bright White
+  }
+}
+
+/**
+ * @brief Applies ANSI SGR (Select Graphic Rendition) color codes.
+ *
+ * @param codes List of ANSI SGR codes to apply.
+ *
+ * Supports:
+ * - 0: Reset to default colors
+ * - 1: Bold/bright (makes current color brighter)
+ * - 30-37: Standard foreground colors
+ * - 40-47: Standard background colors
+ * - 90-97: Bright foreground colors
+ * - 100-107: Bright background colors
+ * - 38;5;N: 256-color foreground (N = 0-255)
+ * - 48;5;N: 256-color background (N = 0-255)
+ * - 38;2;R;G;B: RGB foreground
+ * - 48;2;R;G;B: RGB background
+ */
+void Widgets::Terminal::applyAnsiColor(const QList<int> &codes)
+{
+  for (int i = 0; i < codes.size(); ++i)
+  {
+    const int code = codes[i];
+
+    // Reset to default colors
+    if (code == 0)
+    {
+      m_currentColor = m_palette.color(QPalette::Text);
+      m_currentBgColor = QColor();
+    }
+
+    // Bold/bright - make current color lighter
+    else if (code == 1)
+      m_currentColor = m_currentColor.lighter(130);
+
+    // Standard foreground colors (30-37)
+    else if (code >= 30 && code <= 37)
+      m_currentColor = m_ansiStandardColors[code - 30];
+
+    // Standard background colors (40-47)
+    else if (code >= 40 && code <= 47)
+      m_currentBgColor = m_ansiStandardColors[code - 40];
+
+    // Bright foreground colors (90-97)
+    else if (code >= 90 && code <= 97)
+      m_currentColor = m_ansiBrightColors[code - 90];
+
+    // Bright background colors (100-107)
+    else if (code >= 100 && code <= 107)
+      m_currentBgColor = m_ansiBrightColors[code - 100];
+
+    // 256-color foreground: 38;5;N
+    else if (code == 38 && i + 2 < codes.size() && codes[i + 1] == 5)
+    {
+      const int colorIndex = codes[i + 2];
+      m_currentColor = getColor256(colorIndex);
+      i += 2;
+    }
+
+    // 256-color background: 48;5;N
+    else if (code == 48 && i + 2 < codes.size() && codes[i + 1] == 5)
+    {
+      const int colorIndex = codes[i + 2];
+      m_currentBgColor = getColor256(colorIndex);
+      i += 2;
+    }
+
+    // RGB foreground: 38;2;R;G;B
+    else if (code == 38 && i + 4 < codes.size() && codes[i + 1] == 2)
+    {
+      const int r = codes[i + 2];
+      const int g = codes[i + 3];
+      const int b = codes[i + 4];
+      m_currentColor = QColor(r, g, b);
+      i += 4;
+    }
+
+    // RGB background: 48;2;R;G;B
+    else if (code == 48 && i + 4 < codes.size() && codes[i + 1] == 2)
+    {
+      const int r = codes[i + 2];
+      const int g = codes[i + 3];
+      const int b = codes[i + 4];
+      m_currentBgColor = QColor(r, g, b);
+      i += 4;
+    }
+  }
+}
+
+/**
+ * @brief Converts a 256-color palette index to a QColor.
+ *
+ * @param index Color index (0-255).
+ * @return QColor corresponding to the index.
+ *
+ * Color ranges:
+ * - 0-7: Standard colors
+ * - 8-15: Bright colors
+ * - 16-231: 6x6x6 RGB cube
+ * - 232-255: Grayscale ramp
+ */
+QColor Widgets::Terminal::getColor256(int index) const
+{
+  return getColor256Static(index);
+}
+
+/**
+ * @brief Static version of getColor256 for use without instance.
+ */
+QColor Widgets::Terminal::getColor256Static(int index)
+{
+  // Standard colors (0-7)
+  if (index < 8)
+  {
+    static const QColor standard[8] = {
+        QColor(0, 0, 0),       // Black
+        QColor(170, 0, 0),     // Red
+        QColor(0, 170, 0),     // Green
+        QColor(170, 85, 0),    // Yellow
+        QColor(0, 0, 170),     // Blue
+        QColor(170, 0, 170),   // Magenta
+        QColor(0, 170, 170),   // Cyan
+        QColor(170, 170, 170), // White
+    };
+    return standard[index];
+  }
+
+  // Bright colors (8-15)
+  if (index < 16)
+  {
+    static const QColor bright[8] = {
+        QColor(85, 85, 85),    // Bright Black
+        QColor(255, 85, 85),   // Bright Red
+        QColor(85, 255, 85),   // Bright Green
+        QColor(255, 255, 85),  // Bright Yellow
+        QColor(85, 85, 255),   // Bright Blue
+        QColor(255, 85, 255),  // Bright Magenta
+        QColor(85, 255, 255),  // Bright Cyan
+        QColor(255, 255, 255), // Bright White
+    };
+    return bright[index - 8];
+  }
+
+  // 216-color RGB cube (16-231): 16 + 36*r + 6*g + b
+  if (index < 232)
+  {
+    const int adjusted = index - 16;
+    const int r = (adjusted / 36) % 6;
+    const int g = (adjusted / 6) % 6;
+    const int b = adjusted % 6;
+
+    return QColor(r ? (r * 40 + 55) : 0, g ? (g * 40 + 55) : 0,
+                  b ? (b * 40 + 55) : 0);
+  }
+
+  // Grayscale ramp (232-255): 24 steps
+  const int gray = 8 + (index - 232) * 10;
+  return QColor(gray, gray, gray);
+}
+
+/**
+ * @brief Formats a debug message with optional ANSI colors.
+ *
+ * @param type Message type (QtDebugMsg, QtWarningMsg, etc.).
+ * @param message The message content.
+ * @param useAnsiColors Whether to include ANSI color codes.
+ * @return Formatted message string.
+ *
+ * This static function provides consistent debug message formatting
+ * across the application, with optional ANSI color codes for terminal
+ * output.
+ */
+QString Widgets::Terminal::formatDebugMessage(QtMsgType type,
+                                              const QString &message,
+                                              bool useAnsiColors)
+{
+  QString prefix;
+  QString ansiColor;
+  QString ansiReset;
+
+  if (useAnsiColors)
+    ansiReset = QStringLiteral("\033[0m");
+
+  switch (type)
+  {
+    case QtInfoMsg:
+      prefix = QStringLiteral("[INFO]");
+      if (useAnsiColors)
+        ansiColor = QStringLiteral("\033[36m");
+      break;
+
+    case QtDebugMsg:
+      prefix = QStringLiteral("[DEBG]");
+      if (useAnsiColors)
+        ansiColor = QStringLiteral("\033[32m");
+      break;
+
+    case QtWarningMsg:
+      prefix = QStringLiteral("[WARN]");
+      if (useAnsiColors)
+        ansiColor = QStringLiteral("\033[33m");
+      break;
+
+    case QtCriticalMsg:
+      prefix = QStringLiteral("[CRIT]");
+      if (useAnsiColors)
+        ansiColor = QStringLiteral("\033[31m");
+      break;
+
+    case QtFatalMsg:
+      prefix = QStringLiteral("[FATL]");
+      if (useAnsiColors)
+        ansiColor = QStringLiteral("\033[91m");
+      break;
+
+    default:
+      break;
+  }
+
+  if (useAnsiColors)
+    return QStringLiteral("%1%2 %3%4")
+        .arg(ansiColor, prefix, message, ansiReset);
+  else
+    return QStringLiteral("%1 %2").arg(prefix, message);
+}
+
+/**
+ * @brief Sets the cursor position to a specified point.
+ *
+ * @param position The new cursor position as a QPoint object.
+ *
+ * Updates the cursor position to the specified point if it differs from the
+ * current position, and emits the cursorMoved() signal to indicate the change.
+ *
+ * @see cursorMoved()
+ */
+void Widgets::Terminal::setCursorPosition(const QPoint &position)
+{
+  const QPoint clamped(position.x(), qBound(0, position.y(), MAX_LINES));
+  if (m_cursorPosition != clamped)
+  {
+    m_cursorPosition = clamped;
+    Q_EMIT cursorMoved();
+  }
+}
+
+/**
+ * @brief Sets the cursor position to specified coordinates.
+ *
+ * @param x The new x-coordinate of the cursor.
+ * @param y The new y-coordinate of the cursor.
+ *
+ * Calls the overloaded `setCursorPosition()` function with a QPoint constructed
+ * from the provided coordinates.
+ *
+ * @see setCursorPosition(const QPoint)
+ */
+void Widgets::Terminal::setCursorPosition(const int x, const int y)
+{
+  setCursorPosition(QPoint(x, y));
+}
+
+/**
+ * @brief Replaces or inserts a character in the terminal buffer at a specified
+ * position.
+ *
+ * @param x The x-coordinate (column) where the character should be replaced or
+ *          inserted.
+ * @param y The y-coordinate (line) where the character should be replaced or
+ *          inserted.
+ * @param byte The character to be placed at the specified position.
+ *
+ * This method ensures that:
+ * - The buffer is resized to accommodate the line specified by `y` if it does
+ *   not already exist.
+ * - The line at `y` is long enough to hold the character at position `x`,
+ *   padding with spaces if necessary.
+ * - The character (`byte`) is printable; otherwise, it is replaced with a dot.
+ *
+ * If the position `x` is within the length of the current line, the character
+ * is replaced. If `x` exceeds the current length, the character is appended to
+ * the line.
+ *
+ * @note Non-printable characters are replaced with a dot (`'.'`).
+ *
+ * @see lineCount(), m_data
+ */
+void Widgets::Terminal::replaceData(int x, int y, const QChar &byte)
+{
+  // Ensure the line exists
+  if (y >= m_data.size())
+    m_data.resize(y + 1);
+
+  // Get reference to current line
+  QString &line = m_data[y];
+
+  // Only manage color data if ANSI colors is enabled
+  if (ansiColors())
+  {
+    // Ensure color buffer line exists
+    if (y >= m_colorData.size())
+      m_colorData.resize(y + 1);
+
+    QList<CharColor> &colorLine = m_colorData[y];
+
+    // Pad color line if needed
+    if (x > line.size())
+    {
+      const int padCount = x - line.size();
+      const QColor defaultColor = m_palette.color(QPalette::Text);
+      for (int i = 0; i < padCount; ++i)
+        colorLine.append(CharColor(defaultColor));
+    }
+
+    // Ensure colorLine is long enough
+    while (colorLine.size() < line.size())
+      colorLine.append(CharColor(m_palette.color(QPalette::Text)));
+
+    // Store foreground and background colors for the character position
+    const CharColor charColor(m_currentColor, m_currentBgColor);
+    if (x >= 0 && x < colorLine.size())
+      colorLine[x] = charColor;
+    else if (x >= 0)
+      colorLine.append(charColor);
+  }
+
+  // Pad line to x if needed
+  if (x > line.size())
+    line = line.leftJustified(x, ' ');
+
+  // Set or append the printable character
+  if (x >= 0 && x < line.size())
+    line[x] = byte.isPrint() ? byte : '.';
+  else if (x >= 0)
+    line.append(byte.isPrint() ? byte : '.');
+}
+
+/**
+ * @brief Determines whether a given character should end a text selection.
+ *
+ * This function is used to decide if a given character (`c`) marks the boundary
+ * for ending a text selection operation, such as when selecting a word in a
+ * terminal. The selection ends if the character is a space, a non-character, or
+ * not a letter or number.
+ *
+ * @param c The character to evaluate.
+ * @return true if the character should end the selection, false otherwise.
+ *
+ * The selection will end if:
+ * 1. `c` is a space character (e.g., space, tab).
+ * 2. `c` is a non-character, which includes control characters or other
+ *    special non-printable characters.
+ * 3. `c` is neither a letter nor a number, meaning punctuation marks, symbols,
+ *    and other non-alphanumeric characters will end the selection.
+ */
+bool Widgets::Terminal::shouldEndSelection(const QChar &c)
+{
+  bool end = false;
+  end |= c.isSpace();
+  end |= c.isNonCharacter();
+  end |= (!c.isLetter() && !c.isNumber());
+  return end;
+}
+
+/**
+ * @brief Handles mouse wheel events for scrolling the terminal content.
+ *
+ * @param event A pointer to the QWheelEvent object containing details of the
+ * event.
+ *
+ * This method manages vertical scrolling of the terminal content when the mouse
+ * wheel is used:
+ * - Determines the number of steps to scroll based on the delta values in the
+ *   wheel event.
+ * - Converts wheel steps to line scrolling steps and adjusts the scroll offset
+ *   accordingly.
+ * - If scrolling up, autoscroll is disabled to prevent the view from
+ *   auto-resetting.
+ * - Ensures that the scroll offset remains within valid bounds, and re-enables
+ *   autoscroll if the end of the content is reached.
+ *
+ * @note This method is responsible for maintaining a smooth and user-friendly
+ * scrolling experience, including handling scenarios where autoscroll is
+ * temporarily disabled.
+ *
+ * @see setScrollOffsetY(), setAutoscroll(), linesPerPage(), lineCount()
+ */
+void Widgets::Terminal::wheelEvent(QWheelEvent *event)
+{
+  // Calculate the number of steps
+  int numSteps = 0;
+  auto pixelDelta = event->pixelDelta();
+  auto angleDelta = event->angleDelta();
+  if (!pixelDelta.isNull())
+    numSteps = pixelDelta.y();
+  else
+    numSteps = angleDelta.y();
+
+  // Convert steps to lines
+  if (numSteps > 0)
+    numSteps = qMax(1, numSteps / m_cHeight);
+  else if (numSteps < 0)
+    numSteps = qMin(-1, numSteps / m_cHeight);
+
+  // Disable auto scroll when scrolling up
+  if (numSteps > 0 && autoscroll() && linesPerPage() < lineCount())
+    setAutoscroll(false);
+
+  // Update scroll offset by the number of lines, each step scrolls a few lines
+  if (numSteps != 0)
+  {
+    // Calculate maximum lines that can be displayed in the viewport
+    const int maxScrollOffset = qMax(0, lineCount() - linesPerPage() + 2);
+
+    // Calculate the new scroll offset
+    int offset = m_scrollOffsetY - numSteps;
+
+    // Clamp the offset to stay within valid bounds
+    offset = qMax(0, offset);
+    offset = qMin(offset, maxScrollOffset);
+
+    // Re-enable autoscroll
+    if (offset == maxScrollOffset && !autoscroll())
+      setAutoscroll(true);
+
+    // Update offset
+    setScrollOffsetY(offset);
+  }
+
+  m_stateChanged = true;
+  event->accept();
+}
+
+/**
+ * @brief Handles mouse move events for updating the text selection.
+ *
+ * @param event A pointer to the QMouseEvent object containing details of the
+ * event.
+ *
+ * If mouse tracking is enabled and there is an active selection
+ * (`m_selectionStartCursor` is set), this method:
+ * - Updates the end of the selection as the mouse moves.
+ * - Dynamically adjusts the selection start and end points based on the current
+ *   cursor position, allowing selection in any direction.
+ * - Updates the terminal view to visually reflect the selection change.
+ *
+ * @see positionToCursor(), update()
+ */
+void Widgets::Terminal::mouseMoveEvent(QMouseEvent *event)
+{
+  if (!m_mouseTracking)
+    return;
+
+  // Determine the current cursor position based on the mouse event
+  QPoint currentCursorPos = positionToCursor(event->pos());
+
+  // Check if selection is inverted (from bottom-right to top-left or similar)
+  if ((m_selectionStartCursor.y() > currentCursorPos.y())
+      || (m_selectionStartCursor.y() == currentCursorPos.y()
+          && m_selectionStartCursor.x() > currentCursorPos.x()))
+  {
+    m_selectionStart = currentCursorPos;
+    m_selectionEnd = m_selectionStartCursor;
+  }
+
+  // Normal selection (from top-left to bottom-right or similar)
+  else
+  {
+    m_selectionStart = m_selectionStartCursor;
+    m_selectionEnd = currentCursorPos;
+  }
+
+  m_stateChanged = true;
+  Q_EMIT selectionChanged();
+}
+
+/**
+ * @brief Handles mouse press events for starting text selection.
+ *
+ * @param event A pointer to the QMouseEvent object containing details of the
+ * event.
+ *
+ * When the left mouse button is pressed:
+ * - Enables mouse tracking (`m_mouseTracking`) to allow text selection.
+ * - Clears any existing selection and sets the initial selection point
+ *   (`m_selectionStartCursor`).
+ * - Requests a view update to reflect the start of the selection visually.
+ *
+ * @see update(), positionToCursor()
+ */
+void Widgets::Terminal::mousePressEvent(QMouseEvent *event)
+{
+  if (event->button() == Qt::LeftButton)
+  {
+    m_mouseTracking = true;
+    m_selectionStartCursor = positionToCursor(event->pos());
+    m_selectionStart = m_selectionStartCursor;
+    m_selectionEnd = m_selectionStartCursor;
+    m_stateChanged = true;
+
+    forceActiveFocus();
+    Q_EMIT selectionChanged();
+  }
+}
+
+/**
+ * @brief Handles mouse release events for finalizing text selection.
+ *
+ * @param event A pointer to the QMouseEvent object containing details of the
+ * event.
+ *
+ * When the left mouse button is released:
+ * - If the start and end of the selection are the same, clears the selection.
+ * - Disables mouse tracking and resets the selection starting point.
+ * - Requests a view update to finalize the visual representation of the
+ *   selection.
+ *
+ * @see update(), positionToCursor()
+ */
+void Widgets::Terminal::mouseReleaseEvent(QMouseEvent *event)
+{
+  if (event->button() == Qt::LeftButton)
+  {
+    if (m_selectionStart == m_selectionEnd)
+    {
+      m_selectionStart = QPoint();
+      m_selectionEnd = QPoint();
+    }
+
+    m_selectionStartCursor = QPoint();
+    m_mouseTracking = false;
+    m_stateChanged = true;
+    Q_EMIT selectionChanged();
+  }
+}
+
+/**
+ * @brief Handles mouse double-click events for selecting the word under the
+ * cursor.
+ *
+ * @param event A pointer to the QMouseEvent object containing details of the
+ *              event.
+ *
+ * When the user double-clicks within the terminal, this method:
+ * - Determines the cursor's position based on the double-click location.
+ * - Expands the selection to include the entire word under the cursor.
+ * - Emits the `selectionChanged()` signal to update the visual representation
+ *   of the selection.
+ *
+ * @note This method ensures that a double-click selects a word, similar to
+ *       behavior in standard text editors or terminal emulators.
+ *
+ * @see positionToCursor(), selectionChanged()
+ */
+void Widgets::Terminal::mouseDoubleClickEvent(QMouseEvent *event)
+{
+  auto cursorPos = positionToCursor(event->pos());
+  if (cursorPos.y() >= 0 && cursorPos.y() < m_data.size())
+  {
+    const QString &line = m_data[cursorPos.y()];
+
+    // Find word boundaries by expanding to the left and right
+    int wordStartX = cursorPos.x();
+    int wordEndX = cursorPos.x();
+
+    // Expand to the left until a space or start of the line is found
+    while (wordStartX > 0 && !shouldEndSelection(line[wordStartX - 1]))
+      wordStartX--;
+
+    // Expand to the right until a space or end of the line is found
+    while (wordEndX < line.size() && !shouldEndSelection(line[wordEndX]))
+      wordEndX++;
+
+    // Set selection start and end points
+    m_selectionStart = QPoint(wordStartX, cursorPos.y());
+    m_selectionEnd = QPoint(wordEndX, cursorPos.y());
+
+    // Update view to reflect the selection
+    m_stateChanged = true;
+    Q_EMIT selectionChanged();
+  }
+}

@@ -1,0 +1,17 @@
+Copyright (c) 2020–2026 Alex Spataru <https://github.com/alex-spataru>
+
+Serial Studio Pro'yu kullandığınız ve açık kaynak geliştirmeyi desteklediğiniz
+için teşekkür ederiz! Lisansınız aktif ve ticari ve özel kullanım için
+onaylanmıştır.
+
+→ Destek: alex@serial-studio.com
+→ Çağrı planlayın: https://calendly.com/serial-studio
+→ Müşteri portalı: https://store.serial-studio.com/billing
+→ Daha fazla bilgi edinin: https://serial-studio.com/
+
+Pro özellikler:
+→ MQTT entegrasyonu
+→ XY ve 3D görselleştirme
+→ Ses girişi
+→ CANBus & MODBUS sürücüleri
+→ Öncelikli destek

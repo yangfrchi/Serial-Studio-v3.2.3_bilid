@@ -1,0 +1,1013 @@
+/*
+ * Serial Studio
+ * https://serial-studio.com/
+ *
+ * Copyright (C) 2020–2025 Alex Spataru
+ *
+ * This file is dual-licensed:
+ *
+ * - Under the GNU GPLv3 (or later) for builds that exclude Pro modules.
+ * - Under the Serial Studio Commercial License for builds that include
+ *   any Pro functionality.
+ *
+ * You must comply with the terms of one of these licenses, depending
+ * on your use case.
+ *
+ * For GPL terms, see <https://www.gnu.org/licenses/gpl-3.0.html>
+ * For commercial terms, see LICENSE_COMMERCIAL.md in the project root.
+ *
+ * SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-SerialStudio-Commercial
+ */
+
+#pragma once
+
+#include <cmath>
+#include <memory>
+#include <vector>
+#include <chrono>
+
+#include <QString>
+#include <QJsonArray>
+#include <QJsonObject>
+
+#include "Concepts.h"
+
+//------------------------------------------------------------------------------
+// Standard keys for loading/offloading frame structures using JSON files
+//------------------------------------------------------------------------------
+
+namespace Keys
+{
+inline constexpr auto EOL = "eol";
+inline constexpr auto Icon = "icon";
+inline constexpr auto Title = "title";
+inline constexpr auto TxData = "txData";
+inline constexpr auto Binary = "binary";
+inline constexpr auto TimerMode = "timerMode";
+inline constexpr auto TimerInterval = "timerIntervalMs";
+inline constexpr auto AutoExecute = "autoExecuteOnConnect";
+
+inline constexpr auto FFT = "fft";
+inline constexpr auto LED = "led";
+inline constexpr auto Log = "log";
+inline constexpr auto Min = "min";
+inline constexpr auto Max = "max";
+inline constexpr auto Graph = "graph";
+inline constexpr auto Index = "index";
+inline constexpr auto XAxis = "xAxis";
+inline constexpr auto Alarm = "alarm";
+inline constexpr auto Units = "units";
+inline constexpr auto Value = "value";
+inline constexpr auto Widget = "widget";
+inline constexpr auto FFTMin = "fftMin";
+inline constexpr auto FFTMax = "fftMax";
+inline constexpr auto PltMin = "plotMin";
+inline constexpr auto PltMax = "plotMax";
+inline constexpr auto LedHigh = "ledHigh";
+inline constexpr auto WgtMin = "widgetMin";
+inline constexpr auto WgtMax = "widgetMax";
+inline constexpr auto AlarmLow = "alarmLow";
+inline constexpr auto AlarmHigh = "alarmHigh";
+inline constexpr auto FFTSamples = "fftSamples";
+inline constexpr auto Overview = "overviewDisplay";
+inline constexpr auto AlarmEnabled = "alarmEnabled";
+inline constexpr auto FFTSamplingRate = "fftSamplingRate";
+
+inline constexpr auto Groups = "groups";
+inline constexpr auto Actions = "actions";
+inline constexpr auto Datasets = "datasets";
+
+inline constexpr auto DashboardLayout = "dashboardLayout";
+inline constexpr auto ActiveGroupId = "activeGroupId";
+} // namespace Keys
+
+namespace DataModel
+{
+
+//------------------------------------------------------------------------------
+// Action structure
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Timer mode for an Action.
+ */
+enum class TimerMode
+{
+  Off,            ///< No timer
+  AutoStart,      ///< Starts timer automatically (e.g. on connection)
+  StartOnTrigger, ///< Starts timer when the action is triggered
+  ToggleOnTrigger ///< Toggles timer state with each trigger
+};
+
+/**
+ * @brief Represents a user-defined action or command to send over serial.
+ */
+struct alignas(8) Action
+{
+  int actionId = -1;                    ///< Unique action ID
+  int timerIntervalMs = 100;            ///< Timer interval in ms
+  TimerMode timerMode = TimerMode::Off; ///< Timer behavior mode
+  bool binaryData = false;              ///< If true, txData is binary
+  bool autoExecuteOnConnect = false;    ///< Auto execute on connect
+  QString icon = "Play Property";       ///< Action icon name or path
+  QString title;                        ///< Display title
+  QString txData;                       ///< Data to transmit
+  QString eolSequence;                  ///< End-of-line sequence (e.g. "\r\n")
+};
+static_assert(sizeof(Action) % alignof(Action) == 0, "Unaligned Action struct");
+
+/**
+ * @brief Generates the raw byte sequence to transmit for a given Action.
+ *
+ * This function resolves the action’s `txData` and `eolSequence` fields
+ * into a final `QByteArray` suitable for serial transmission.
+ *
+ * This function exists outside the Frame definition to avoid circular
+ * dependencies between `Frame.h` and `SerialStudio.h`.
+ *
+ * @param action The Action to generate the transmission bytes from.
+ * @return QByteArray containing the resolved byte stream to transmit.
+ */
+QByteArray get_tx_bytes(const Action &action);
+
+//------------------------------------------------------------------------------
+// Dataset structure
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Represents a single unit of sensor data with optional metadata and
+ * graphing. Fully aligned and stack-optimized.
+ */
+struct alignas(8) Dataset
+{
+  int index = 0;                ///< Frame offset index
+  int xAxisId = -1;             ///< Optional reference to x-axis dataset
+  int groupId = 0;              ///< Owning group ID
+  int uniqueId = 0;             ///< Unique ID within frame
+  int datasetId = 0;            ///< Unique ID within group
+  int fftSamples = 256;         ///< Number of samples for FFT
+  int fftSamplingRate = 100;    ///< Sampling rate for FFT
+  bool fft = false;             ///< Enables FFT processing
+  bool led = false;             ///< Enables LED widget
+  bool log = false;             ///< Enables logging
+  bool plt = false;             ///< Enables plotting
+  bool alarmEnabled = false;    ///< Enable/disable alarm values
+  bool overviewDisplay = false; ///< Show in overview
+  bool isNumeric = false;       ///< True if value was parsed as numeric
+  double fftMin = 0;            ///< Minimum value (for FFT)
+  double fftMax = 0;            ///< Maximum value (for FFT)
+  double pltMin = 0;            ///< Minimum value (for plots)
+  double pltMax = 0;            ///< Maximum value (for plots)
+  double wgtMin = 0;            ///< Minimum value (for widgets)
+  double wgtMax = 100;          ///< Maximum value (for widgets)
+  double ledHigh = 80;          ///< LED activation threshold
+  double alarmLow = 20;         ///< Low alarm threshold
+  double alarmHigh = 80;        ///< High alarm threshold
+  double numericValue = 0;      ///< Parsed numeric value
+  QString value;                ///< Raw string value
+  QString title;                ///< Human-readable title
+  QString units;                ///< Measurement units (e.g., °C)
+  QString widget;               ///< Widget type (bar, gauge, etc.)
+};
+static_assert(sizeof(Dataset) % alignof(Dataset) == 0,
+              "Unaligned Dataset struct");
+
+//------------------------------------------------------------------------------
+// Group structure
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Represents a collection of datasets that are related (e.g., for a
+ * specific sensor).
+ */
+struct alignas(8) Group
+{
+  int groupId = -1;              ///< Unique group identifier
+  QString title;                 ///< Group display name
+  QString widget;                ///< Group widget type
+  std::vector<Dataset> datasets; ///< Datasets contained in this group
+};
+static_assert(sizeof(Group) % alignof(Group) == 0, "Unaligned Group struct");
+
+//------------------------------------------------------------------------------
+// Frame structure
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Represents a full data frame, including groups and actions.
+ *        This is the root structure for each UI update.
+ */
+struct alignas(8) Frame
+{
+  QString title;                           ///< Frame title
+  std::vector<Group> groups;               ///< Sensor groups in this frame
+  std::vector<Action> actions;             ///< Triggerable actions
+  bool containsCommercialFeatures = false; ///< Feature gating flag
+};
+static_assert(sizeof(Frame) % alignof(Frame) == 0, "Unaligned Frame struct");
+
+//------------------------------------------------------------------------------
+// Frame utilities and post-processing
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Clears and resets a Frame object to its default state.
+ *
+ * This utility function performs a full reset of a Frame by:
+ * - Clearing the frame title string
+ * - Clearing all groups and actions vectors
+ * - Releasing memory held by groups and actions via `shrink_to_fit()`
+ * - Resetting `containsCommercialFeatures` to `false`
+ *
+ * **Performance:**
+ * - Time: O(n) where n = total datasets across all groups
+ * - Space: Releases all heap-allocated memory for groups/actions
+ *
+ * **Use Cases:**
+ * - Recycling Frame objects in object pools
+ * - Resetting state when switching data sources
+ * - Preparing for new frame deserialization
+ *
+ * **Thread Safety:** Not thread-safe - caller must synchronize access
+ *
+ * @param frame The Frame object to be cleared and reset
+ *
+ * @note Prefer this over destroying and recreating Frame objects to reduce
+ *       allocator pressure in high-frequency scenarios
+ */
+inline void clear_frame(Frame &frame) noexcept
+{
+  frame.title.clear();
+  frame.groups.clear();
+  frame.actions.clear();
+  frame.groups.shrink_to_fit();
+  frame.actions.shrink_to_fit();
+  frame.containsCommercialFeatures = false;
+}
+
+/**
+ * @brief Copies only dataset values from source to destination frame.
+ *
+ * This function performs a fast value-only copy between two structurally
+ * equivalent frames. It assumes both frames have identical structure (same
+ * groups and datasets) and only copies the mutable value fields.
+ *
+ * **Copied Fields per Dataset:**
+ * - value (QString)
+ * - numericValue (double)
+ * - isNumeric (bool)
+ *
+ * **Performance:**
+ * - Time: O(d) where d = total datasets across all groups
+ * - Space: O(1) - no allocations, reuses existing vectors
+ * - Compared to full copy: ~10x faster for typical frames
+ *
+ * **Precondition:** Both frames must have identical structure (same number
+ * of groups and datasets per group). Use compare_frames() to verify.
+ *
+ * **Thread Safety:** Not thread-safe - caller must synchronize access
+ *
+ * @param dst Destination frame (must have same structure as src)
+ * @param src Source frame to copy values from
+ *
+ * @warning Undefined behavior if frames have different structures
+ */
+inline void copy_frame_values(Frame &dst, const Frame &src) noexcept
+{
+  const size_t groupCount = src.groups.size();
+  for (size_t g = 0; g < groupCount; ++g)
+  {
+    const auto &srcGroup = src.groups[g];
+    auto &dstGroup = dst.groups[g];
+    const size_t datasetCount = srcGroup.datasets.size();
+    for (size_t d = 0; d < datasetCount; ++d)
+    {
+      const auto &srcDataset = srcGroup.datasets[d];
+      auto &dstDataset = dstGroup.datasets[d];
+      dstDataset.value = srcDataset.value;
+      dstDataset.numericValue = srcDataset.numericValue;
+      dstDataset.isNumeric = srcDataset.isNumeric;
+    }
+  }
+}
+
+/**
+ * @brief Compares two frames for structural equivalence.
+ *
+ * This function checks whether two Frame instances have the same group count,
+ * matching group IDs, and identical dataset `index` values within each group.
+ *
+ * **Comparison Scope:**
+ * - Checked: Group count, group IDs, dataset count, dataset indices
+ * - Ignored: Titles, actions, values, units, widget types
+ *
+ * **Use Cases:**
+ * - Detecting frame structure changes during live updates
+ * - Validating compatibility between recorded and live data
+ * - Determining if dashboard layout needs regeneration
+ *
+ * **Performance:**
+ * - Best case: O(1) when group counts differ
+ * - Average case: O(g) where g = number of groups (when early mismatch)
+ * - Worst case: O(g × d) where d = average datasets per group
+ *
+ * **Thread Safety:** Safe if both frames are immutable during comparison
+ *
+ * @param a First frame to compare
+ * @param b Second frame to compare
+ * @return true if both frames are structurally equivalent; false otherwise
+ *
+ * @note This is used in hot path for frame change detection - keep optimized
+ */
+[[nodiscard]] inline bool compare_frames(const Frame &a,
+                                         const Frame &b) noexcept
+{
+  if (a.groups.size() != b.groups.size())
+    return false;
+
+  const auto &groupsA = a.groups;
+  const auto &groupsB = b.groups;
+
+  for (size_t i = 0, gc = groupsA.size(); i < gc; ++i)
+  {
+    const auto &g1 = groupsA[i];
+    const auto &g2 = groupsB[i];
+
+    if (g1.groupId != g2.groupId) [[unlikely]]
+      return false;
+
+    const auto &datasetsA = g1.datasets;
+    const auto &datasetsB = g2.datasets;
+
+    const size_t dc = datasetsA.size();
+    if (dc != datasetsB.size()) [[unlikely]]
+      return false;
+
+    for (size_t j = 0; j < dc; ++j)
+    {
+      if (datasetsA[j].index != datasetsB[j].index) [[unlikely]]
+        return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * @brief Finalizes a Frame after deserialization.
+ *
+ * This function performs post-processing on a Frame object after it has been
+ * read from JSON.
+ *
+ * This function exists outside the Frame definition to avoid circular
+ * dependencies between `Frame.h` and `SerialStudio.h`.
+ *
+ * @param frame The Frame object to finalize.
+ */
+void finalize_frame(Frame &frame);
+
+/**
+ * @brief Reads and parses I/O frame settings from a JSON object.
+ *
+ * This function extracts serial frame delimiters and checksum settings
+ * from the given JSON configuration. It supports both hexadecimal and
+ * escaped string formats.
+ *
+ * This function exists outside the Frame definition to avoid circular
+ * dependencies between `Frame.h` and `SerialStudio.h`.
+ *
+ * @param frameStart Output byte array for the start-of-frame marker.
+ * @param frameEnd Output byte array for the end-of-frame marker.
+ * @param checksum Output string indicating the checksum method to use.
+ * @param obj Input JSON object containing the I/O settings.
+ */
+void read_io_settings(QByteArray &frameStart, QByteArray &frameEnd,
+                      QString &checksum, const QJsonObject &obj);
+
+//------------------------------------------------------------------------------
+// Data -> JSON serialization
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Serializes an Action to a QJsonObject.
+ *
+ * Converts an Action object into a JSON representation containing:
+ * - `icon`: The icon associated with the action.
+ * - `title`: The display title of the action.
+ * - `txData`: The data to transmit.
+ * - `eol`: The end-of-line sequence (e.g., "\\r\\n").
+ * - `binary`: Whether the data should be interpreted as binary.
+ * - `timerIntervalMs`: Timer interval in milliseconds.
+ * - `timerMode`: Integer value representing the timer mode enum.
+ * - `autoExecuteOnConnect`: Whether to auto-execute this action on device
+ *                           connection.
+ *
+ * @param a The Action object to serialize.
+ * @return QJsonObject representing the Action.
+ */
+[[nodiscard]] inline QJsonObject serialize(const Action &a)
+{
+  QJsonObject obj;
+  obj.insert(Keys::Icon, a.icon);
+  obj.insert(Keys::Title, a.title);
+  obj.insert(Keys::TxData, a.txData);
+  obj.insert(Keys::EOL, a.eolSequence);
+  obj.insert(Keys::Binary, a.binaryData);
+  obj.insert(Keys::TimerInterval, a.timerIntervalMs);
+  obj.insert(Keys::AutoExecute, a.autoExecuteOnConnect);
+  obj.insert(Keys::TimerMode, static_cast<int>(a.timerMode));
+  return obj;
+}
+
+/**
+ * @brief Serializes a Dataset to a QJsonObject.
+ *
+ * Converts a Dataset object into a JSON structure including:
+ * - Flags: `fft`, `led`, `log`, `graph`, `overviewDisplay`
+ * - Indices: `index`, `xAxis`
+ * - Thresholds: `ledHigh`, `alarmLow`, `alarmHigh`
+ * - Limits: `min`, `max` (automatically ordered via qMin/qMax)
+ * - Metadata: `title`, `value`, `units`, `widget`, `fftWindow`
+ * - FFT settings: `fftSamples`, `fftSamplingRate`
+ *
+ * All QString fields are simplified (trimmed and collapsed whitespace).
+ *
+ * @param d The Dataset object to serialize.
+ * @return QJsonObject representing the Dataset.
+ */
+[[nodiscard]] inline QJsonObject serialize(const Dataset &d)
+{
+  QJsonObject obj;
+  obj.insert(Keys::FFT, d.fft);
+  obj.insert(Keys::LED, d.led);
+  obj.insert(Keys::Log, d.log);
+  obj.insert(Keys::Graph, d.plt);
+  obj.insert(Keys::Index, d.index);
+  obj.insert(Keys::XAxis, d.xAxisId);
+  obj.insert(Keys::LedHigh, d.ledHigh);
+  obj.insert(Keys::FFTSamples, d.fftSamples);
+  obj.insert(Keys::Overview, d.overviewDisplay);
+  obj.insert(Keys::Title, d.title.simplified());
+  obj.insert(Keys::Value, d.value.simplified());
+  obj.insert(Keys::Units, d.units.simplified());
+  obj.insert(Keys::AlarmEnabled, d.alarmEnabled);
+  obj.insert(Keys::Widget, d.widget.simplified());
+  obj.insert(Keys::FFTMin, qMin(d.fftMin, d.fftMax));
+  obj.insert(Keys::FFTMax, qMax(d.fftMin, d.fftMax));
+  obj.insert(Keys::PltMin, qMin(d.pltMin, d.pltMax));
+  obj.insert(Keys::PltMax, qMax(d.pltMin, d.pltMax));
+  obj.insert(Keys::WgtMin, qMin(d.wgtMin, d.wgtMax));
+  obj.insert(Keys::WgtMax, qMax(d.wgtMin, d.wgtMax));
+  obj.insert(Keys::FFTSamplingRate, d.fftSamplingRate);
+  obj.insert(Keys::AlarmLow, qMin(d.alarmLow, d.alarmHigh));
+  obj.insert(Keys::AlarmHigh, qMax(d.alarmLow, d.alarmHigh));
+  return obj;
+}
+
+/**
+ * @brief Serializes a Group to a QJsonObject.
+ *
+ * Converts a Group and all of its Datasets into a JSON structure:
+ * - `title`: Group display name (simplified)
+ * - `widget`: Widget type for visual display (simplified)
+ * - `datasets`: Array of serialized Datasets
+ *
+ * @param g The Group object to serialize.
+ * @return QJsonObject representing the Group.
+ */
+[[nodiscard]] inline QJsonObject serialize(const Group &g)
+{
+  QJsonArray datasetArray;
+  for (const auto &dataset : g.datasets)
+    datasetArray.append(serialize(dataset));
+
+  QJsonObject obj;
+  obj.insert(Keys::Datasets, datasetArray);
+  obj.insert(Keys::Title, g.title.simplified());
+  obj.insert(Keys::Widget, g.widget.simplified());
+  return obj;
+}
+
+/**
+ * @brief Serializes a Frame to a QJsonObject.
+ *
+ * Converts a Frame and its contents into a full JSON object including:
+ * - `title`: Frame title
+ * - `groups`: Array of serialized Group objects
+ * - `actions`: Array of serialized Action objects
+ *
+ * This function is used to export the entire runtime model to JSON.
+ *
+ * @param f The Frame object to serialize.
+ * @return QJsonObject representing the complete Frame.
+ */
+[[nodiscard]] inline QJsonObject serialize(const Frame &f)
+{
+  QJsonArray groupArray;
+  for (const auto &group : f.groups)
+    groupArray.append(serialize(group));
+
+  QJsonArray actionArray;
+  for (const auto &action : f.actions)
+    actionArray.append(serialize(action));
+
+  QJsonObject obj;
+  obj.insert(Keys::Title, f.title);
+  obj.insert(Keys::Groups, groupArray);
+  obj.insert(Keys::Actions, actionArray);
+  return obj;
+}
+
+//------------------------------------------------------------------------------
+// Utility functions for data deserialization
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Reads a value from a QJsonObject based on a key, returning a default
+ *        value if the key does not exist.
+ *
+ * This function checks if the given key exists in the provided QJsonObject.
+ * If the key is found, it returns the associated value. Otherwise, it returns
+ * the specified default value.
+ *
+ * @param object The QJsonObject to read the data from.
+ * @param key The key to look for in the QJsonObject.
+ * @param defaultValue The value to return if the key is not found in JSON.
+ *
+ * @return The value associated with the key, or the defaultValue if the key is
+ *         not present.
+ */
+[[nodiscard]] inline QVariant ss_jsr(const QJsonObject &object,
+                                     const QString &key,
+                                     const QVariant &defaultValue)
+{
+  if (object.contains(key))
+    return object.value(key);
+
+  return defaultValue;
+}
+
+//------------------------------------------------------------------------------
+// Data deserialization
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Deserializes an Action from a QJsonObject.
+ *
+ * Parses fields from JSON into an Action structure, including:
+ * - `txData`: Transmit data
+ * - `eol`: End-of-line sequence
+ * - `binary`: Binary mode flag
+ * - `icon`: Icon path or name
+ * - `title`: Display name
+ * - `timerIntervalMs`: Timer interval in milliseconds
+ * - `autoExecuteOnConnect`: Whether to trigger action on connection
+ * - `timerMode`: TimerMode enum (validated and cast safely)
+ *
+ * @param a Output Action object to populate.
+ * @param obj JSON object to read from.
+ * @return true if valid and successfully parsed, false otherwise.
+ */
+[[nodiscard]] inline bool read(Action &a, const QJsonObject &obj)
+{
+  if (obj.isEmpty())
+    return false;
+
+  a.txData = ss_jsr(obj, Keys::TxData, "").toString();
+  a.eolSequence = ss_jsr(obj, Keys::EOL, "").toString();
+  a.binaryData = ss_jsr(obj, Keys::Binary, false).toBool();
+  a.icon = ss_jsr(obj, Keys::Icon, "").toString().simplified();
+  a.title = ss_jsr(obj, Keys::Title, "").toString().simplified();
+  a.timerIntervalMs = ss_jsr(obj, Keys::TimerInterval, 100).toInt();
+  a.autoExecuteOnConnect = ss_jsr(obj, Keys::AutoExecute, false).toBool();
+
+  const int mode = ss_jsr(obj, Keys::TimerMode, 0).toInt();
+  if (mode >= 0 && mode <= 3)
+    a.timerMode = static_cast<TimerMode>(mode);
+  else
+    a.timerMode = TimerMode::Off;
+
+  return true;
+}
+
+/**
+ * @brief Deserializes a Dataset from a QJsonObject.
+ *
+ * Parses all dataset configuration fields, including:
+ * - Structural fields: `index`, `groupId`, `datasetId`, `xAxis`
+ * - Visualization flags: `fft`, `led`, `log`, `plt`, `overviewDisplay`
+ * - Thresholds and limits: `min`, `max`, `ledHigh`, `alarmLow`, `alarmHigh`
+ * - FFT settings: `fftSamples`, `fftSamplingRate`, `fftWindow`
+ * - Display info: `title`, `value`, `units`, `widget`
+ *
+ * If a numeric value is detected in `value`, it's parsed and stored in
+ * `numericValue` with the `isNumeric` flag set.
+ *
+ * Handles legacy single `alarm` field if both high/low are unset.
+ * Applies auto-normalization for min/max order.
+ *
+ * @param d Output Dataset object to populate.
+ * @param obj JSON object to parse.
+ * @return true if successfully parsed, false if input is malformed.
+ */
+[[nodiscard]] inline bool read(Dataset &d, const QJsonObject &obj)
+{
+  if (obj.isEmpty())
+    return false;
+
+  d.index = ss_jsr(obj, Keys::Index, -1).toInt();
+  d.fft = ss_jsr(obj, Keys::FFT, false).toBool();
+  d.led = ss_jsr(obj, Keys::LED, false).toBool();
+  d.log = ss_jsr(obj, Keys::Log, false).toBool();
+  d.plt = ss_jsr(obj, Keys::Graph, false).toBool();
+  d.xAxisId = ss_jsr(obj, Keys::XAxis, -1).toInt();
+  d.fftMin = ss_jsr(obj, Keys::FFTMin, 0).toDouble();
+  d.fftMax = ss_jsr(obj, Keys::FFTMax, 0).toDouble();
+  d.pltMin = ss_jsr(obj, Keys::PltMin, 0).toDouble();
+  d.pltMax = ss_jsr(obj, Keys::PltMax, 0).toDouble();
+  d.wgtMin = ss_jsr(obj, Keys::WgtMin, 0).toDouble();
+  d.wgtMax = ss_jsr(obj, Keys::WgtMax, 0).toDouble();
+  d.fftSamples = ss_jsr(obj, Keys::FFTSamples, -1).toInt();
+  d.title = ss_jsr(obj, Keys::Title, "").toString().simplified();
+  d.value = ss_jsr(obj, Keys::Value, "").toString().simplified();
+  d.units = ss_jsr(obj, Keys::Units, "").toString().simplified();
+  d.overviewDisplay = ss_jsr(obj, Keys::Overview, false).toBool();
+  d.alarmEnabled = ss_jsr(obj, Keys::AlarmEnabled, false).toBool();
+  d.ledHigh = ss_jsr(obj, Keys::LedHigh, 0).toDouble();
+  d.widget = ss_jsr(obj, Keys::Widget, "").toString().simplified();
+  d.alarmLow = ss_jsr(obj, Keys::AlarmLow, 0).toDouble();
+  d.fftSamplingRate = ss_jsr(obj, Keys::FFTSamplingRate, -1).toInt();
+  d.alarmHigh = ss_jsr(obj, Keys::AlarmHigh, 0).toDouble();
+  if (d.value.isEmpty())
+    d.value = QStringLiteral("--.--");
+  else
+    d.numericValue = d.value.toDouble(&d.isNumeric);
+
+  if (!obj.contains(Keys::FFTMin) || !obj.contains(Keys::FFTMax))
+  {
+    d.fftMin = ss_jsr(obj, Keys::Min, 0).toDouble();
+    d.fftMax = ss_jsr(obj, Keys::Max, 0).toDouble();
+  }
+
+  if (!obj.contains(Keys::PltMin) || !obj.contains(Keys::PltMax))
+  {
+    d.pltMin = ss_jsr(obj, Keys::Min, 0).toDouble();
+    d.pltMax = ss_jsr(obj, Keys::Max, 0).toDouble();
+  }
+
+  if (!obj.contains(Keys::WgtMin) || !obj.contains(Keys::WgtMax))
+  {
+    d.wgtMin = ss_jsr(obj, Keys::Min, 0).toDouble();
+    d.wgtMax = ss_jsr(obj, Keys::Max, 0).toDouble();
+  }
+
+  if (obj.contains(Keys::Alarm))
+  {
+    if (std::isnan(d.alarmHigh) && std::isnan(d.alarmLow))
+    {
+      auto alarm = ss_jsr(obj, Keys::Alarm, 0).toDouble();
+      d.alarmHigh = alarm;
+    }
+  }
+
+  if (!std::isnan(d.fftMin) && !std::isnan(d.fftMax))
+  {
+    d.fftMin = qMin(d.fftMin, d.fftMax);
+    d.fftMax = qMax(d.fftMin, d.fftMax);
+  }
+
+  if (!std::isnan(d.pltMin) && !std::isnan(d.pltMax))
+  {
+    d.pltMin = qMin(d.pltMin, d.pltMax);
+    d.pltMax = qMax(d.pltMin, d.pltMax);
+  }
+
+  if (!std::isnan(d.wgtMin) && !std::isnan(d.wgtMax))
+  {
+    d.wgtMin = qMin(d.wgtMin, d.wgtMax);
+    d.wgtMax = qMax(d.wgtMin, d.wgtMax);
+  }
+
+  return true;
+}
+
+/**
+ * @brief Deserializes a Group from a QJsonObject.
+ *
+ * Reads a group’s metadata and its dataset array. Each dataset is deserialized
+ * and automatically assigned:
+ * - `datasetId` based on array index
+ * - `groupId` inherited from parent group
+ *
+ * Expects:
+ * - `title`: Group title
+ * - `widget`: Widget type
+ * - `datasets`: Array of Dataset objects
+ *
+ * @param g Output Group object to populate.
+ * @param obj JSON object representing a group.
+ * @return true if group and datasets were valid and parsed correctly.
+ */
+[[nodiscard]] inline bool read(Group &g, const QJsonObject &obj)
+{
+  if (obj.isEmpty())
+    return false;
+
+  const auto array = obj.value(Keys::Datasets).toArray();
+  const auto title = ss_jsr(obj, Keys::Title, "").toString().simplified();
+  const auto widget = ss_jsr(obj, Keys::Widget, "").toString().simplified();
+
+  if (!title.isEmpty() && !array.isEmpty())
+  {
+    g.title = title;
+    g.widget = widget;
+    g.datasets.clear();
+    g.datasets.reserve(array.count());
+
+    bool ok = true;
+    for (qsizetype i = 0; i < array.count(); ++i)
+    {
+      const auto dObj = array[i].toObject();
+      if (!dObj.isEmpty())
+      {
+        Dataset dataset;
+        ok &= read(dataset, dObj);
+
+        if (ok)
+        {
+          dataset.datasetId = i;
+          dataset.groupId = g.groupId;
+          g.datasets.push_back(dataset);
+        }
+
+        else
+          break;
+      }
+    }
+
+    return ok;
+  }
+
+  return false;
+}
+
+/**
+ * @brief Deserializes a Frame from a QJsonObject.
+ *
+ * Parses the entire frame hierarchy, including:
+ * - `title`: Frame title
+ * - `groups`: Array of Group objects
+ * - `actions`: Array of Action objects
+ *
+ * Each group and dataset is assigned unique IDs based on position.
+ * Automatically calls `finalize_frame()` after successful parse to compute
+ * `containsCommercialFeatures` and assign Dataset unique IDs.
+ *
+ * @param f Output Frame object to populate.
+ * @param obj JSON object representing the frame.
+ * @return true if the frame is valid and successfully parsed.
+ */
+[[nodiscard]] inline bool read(Frame &f, const QJsonObject &obj)
+{
+  if (obj.isEmpty())
+    return false;
+
+  const auto groups = obj.value(Keys::Groups).toArray();
+  const auto actions = obj.value(Keys::Actions).toArray();
+  const auto title = ss_jsr(obj, Keys::Title, "").toString().simplified();
+
+  if (!title.isEmpty() && !groups.isEmpty())
+  {
+    f.title = title;
+    f.groups.clear();
+    f.actions.clear();
+    f.groups.reserve(groups.count());
+    f.actions.reserve(actions.count());
+
+    bool ok = true;
+    for (qsizetype i = 0; i < groups.count(); ++i)
+    {
+      Group group;
+      group.groupId = i;
+      ok &= read(group, groups[i].toObject());
+      if (ok)
+        f.groups.push_back(group);
+      else
+        break;
+    }
+
+    if (ok)
+    {
+      for (qsizetype i = 0; i < actions.count(); ++i)
+      {
+        Action action;
+        ok &= read(action, actions[i].toObject());
+        if (ok)
+          f.actions.push_back(action);
+        else
+          break;
+      }
+    }
+
+    if (ok)
+      finalize_frame(f);
+
+    return ok;
+  }
+
+  return false;
+}
+
+//------------------------------------------------------------------------------
+// Timestamped data
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Represents a single timestamped frame for data export.
+ *
+ * Stores a JSON frame and the associated reception timestamp using
+ * steady_clock with nanosecond precision. This is optimized for high-frequency
+ * data acquisition (192kHz+) where timestamp precision and low overhead are
+ * critical.
+ *
+ * **Design Rationale:**
+ * - Frame data is embedded by value for single-allocation efficiency
+ * - When wrapped in TimestampedFramePtr (shared_ptr), only ONE heap allocation
+ *   is needed per frame, compared to two with nested shared_ptr
+ * - Single timestamp (steady_clock) provides nanosecond precision with minimal
+ *   syscall overhead. Wall-clock time can be derived using a cached offset
+ *   when needed (see MDF4::ExportWorker).
+ *
+ * **Memory Layout:**
+ * - data: sizeof(Frame) bytes (embedded by value)
+ * - timestamp: 8 bytes (nanosecond-precision monotonic time)
+ * - Total: sizeof(Frame) + 8 bytes (single contiguous allocation)
+ *
+ * **Thread Safety:**
+ * - Safe: Reading from multiple threads after construction
+ * - Unsafe: Concurrent construction or modification
+ * - Move-only semantics prevent accidental copies
+ *
+ * **Performance:**
+ * - Construction: O(n) where n = frame complexity (copy into embedded storage)
+ * - Single allocation when used with make_shared<TimestampedFrame>
+ * - Better cache locality than pointer indirection
+ * - Copy: Disabled (move-only type)
+ * - Move: O(1) - transfers ownership
+ *
+ * @see TimestampedFramePtr for the canonical shared wrapper type
+ */
+struct TimestampedFrame
+{
+  using SteadyClock = std::chrono::steady_clock;
+  using SteadyTimePoint = SteadyClock::time_point;
+
+  DataModel::Frame data;
+  SteadyTimePoint timestamp;
+
+  /**
+   * @brief Default constructor - creates empty timestamped frame.
+   */
+  TimestampedFrame() = default;
+
+  /**
+   * @brief Constructs a timestamped frame by copying frame data.
+   *
+   * Copies the frame data and captures high-resolution monotonic time
+   * (steady_clock) at construction with nanosecond precision.
+   *
+   * @param f Frame data to copy into this timestamped frame
+   */
+  explicit TimestampedFrame(const DataModel::Frame &f)
+    : data(f)
+    , timestamp(SteadyClock::now())
+  {
+  }
+
+  /**
+   * @brief Constructs a timestamped frame by moving frame data.
+   *
+   * Moves the frame data and captures high-resolution monotonic time
+   * (steady_clock) at construction with nanosecond precision.
+   *
+   * @param f Frame data to move into this timestamped frame
+   */
+  explicit TimestampedFrame(DataModel::Frame &&f) noexcept
+    : data(std::move(f))
+    , timestamp(SteadyClock::now())
+  {
+  }
+
+  TimestampedFrame(TimestampedFrame &&) noexcept = default;
+  TimestampedFrame(const TimestampedFrame &) = delete;
+  TimestampedFrame &operator=(TimestampedFrame &&) noexcept = default;
+  TimestampedFrame &operator=(const TimestampedFrame &) = delete;
+};
+
+//------------------------------------------------------------------------------
+// Shared pointer definitions
+//------------------------------------------------------------------------------
+
+/**
+ * @typedef TimestampedFramePtr
+ * @brief Shared pointer to a TimestampedFrame for efficient multi-consumer
+ *        distribution.
+ *
+ * This typedef defines the canonical type for passing timestamped frames from
+ * the main thread to worker threads in the frame consumer architecture.
+ *
+ * **Design Rationale:**
+ * - **Zero-copy distribution**: A single TimestampedFrame instance can be
+ *   safely shared across multiple worker threads (CSV export, MDF4 export,
+ *   Plugins server) without deep copying on the hotpath.
+ * - **Move semantics**: TimestampedFrame itself is move-only (non-copyable)
+ *   to prevent accidental copies, so it must be wrapped in a shared_ptr for
+ *   multi-consumer scenarios.
+ * - **Thread safety**: The underlying Frame data is immutable
+ *   (std::shared_ptr<const Frame>), ensuring safe concurrent access from
+ *   worker threads.
+ *
+ * **Usage:**
+ * - **Producer (FrameBuilder)**: Creates a TimestampedFramePtr via
+ *   `std::make_shared<TimestampedFrame>(frame_data)` and distributes it to
+ *   all registered consumers.
+ * - **Consumers (CSV::Export, MDF4::Export)**: Receive TimestampedFramePtr
+ *   through lock-free queues and process asynchronously on worker threads.
+ *
+ * **Type Safety:**
+ * - This typedef already includes the `std::shared_ptr<>` wrapper.
+ * - Never wrap it in another shared_ptr (i.e., avoid
+ *   `std::shared_ptr<TimestampedFramePtr>`).
+ *
+ * @see TimestampedFrame
+ * @see FrameConsumer
+ * @see FrameBuilder::hotpathTxFrame()
+ */
+typedef std::shared_ptr<DataModel::TimestampedFrame> TimestampedFramePtr;
+
+//------------------------------------------------------------------------------
+// Generic utilities using C++20 concepts
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Generic JSON serialization for any Serializable type.
+ *
+ * Provides compile-time guarantee that T has a serialize() function.
+ * Useful for template code operating on Frame, Group, Dataset, or Action.
+ *
+ * **Performance:** O(n) where n = object complexity
+ * **Thread Safety:** Safe if input object is immutable
+ *
+ * @tparam T Type satisfying the Serializable concept
+ * @param obj Object to serialize
+ * @return JSON representation of the object
+ */
+template<Concepts::Serializable T>
+[[nodiscard]] inline QJsonObject toJson(const T &obj) noexcept
+{
+  return serialize(obj);
+}
+
+/**
+ * @brief Generic JSON deserialization with validation for Serializable types.
+ *
+ * Provides compile-time guarantee that T has a read() function.
+ * Returns std::optional for safer error handling.
+ *
+ * **Performance:** O(n) where n = JSON complexity
+ * **Thread Safety:** Safe (creates new object)
+ *
+ * @tparam T Type satisfying the Serializable concept
+ * @param json JSON object to deserialize
+ * @return Optional containing the deserialized object if successful
+ */
+template<Concepts::Serializable T>
+[[nodiscard]] inline std::optional<T> fromJson(const QJsonObject &json) noexcept
+{
+  T obj;
+  if (read(obj, json))
+    return obj;
+
+  return std::nullopt;
+}
+
+/**
+ * @brief Validates a Frameable object's structure.
+ *
+ * Checks that a Frame-like object has valid groups and actions.
+ * Provides compile-time guarantee that T has groups/actions members.
+ *
+ * **Performance:** O(1) - only checks counts
+ * **Thread Safety:** Safe if object is immutable
+ *
+ * @tparam T Type satisfying the Frameable concept
+ * @param frame Frame-like object to validate
+ * @return true if frame has at least one group
+ */
+template<Concepts::Frameable T>
+[[nodiscard]] constexpr bool isValidFrame(const T &frame) noexcept
+{
+  return !frame.groups.empty();
+}
+
+} // namespace DataModel
