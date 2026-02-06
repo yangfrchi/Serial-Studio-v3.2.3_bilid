@@ -215,11 +215,11 @@ jobs:
 #-------------------------------------------------------------------------------
 # Create release
 #-------------------------------------------------------------------------------
- upload:
+  upload:
     name: '🗂 Create release and upload artifacts'
     needs:
       - build-windows
-      
+
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.ref_name || 'continuous' }}
